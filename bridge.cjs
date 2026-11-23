@@ -2,10 +2,10 @@
 
 const fs = require('node:fs');
 const path = require('node:path');
-const { execFile } = require('node:child_process');
+const childProcess = require('node:child_process');
 const { removeSkillCopies } = require('./skills.cjs');
 const { homedir } = require('node:os');
-const { reconcile } = require('./reconcile.cjs');
+const { reconcile, deferRemoval, cancelPendingRemoval } = require('./reconcile.cjs');
 const { translateMcp } = require('./mcp.cjs');
 
 function json(file, label) {
@@ -113,6 +113,8 @@ function startBridge(directory, report) {
   if (!specs.size) throw new Error('Cannot identify the running Oleafly plugin. Refresh it on the Magpie Plugins page.');
   privateDirectory(stage);
   const enabled = () => pluginList(directory).some(row => specs.has(row.spec) && !row.off);
+  if (enabled()) cancelPendingRemoval(dataDir);
+  const cleanupSource = fs.openSync(require.resolve('./reconcile.cjs'), 'r');
   const watched = [modelFile, mcpFile, libraryFile, skillsDir, path.join(directory, 'plugins.json'),
     path.join(dataDir, 'config.json'), path.join(dataDir, 'ai-secrets.json'), path.join(dataDir, 'mcp-server-secrets.json')];
   function signature() {
@@ -150,16 +152,17 @@ function startBridge(directory, report) {
     return undefined;
   }
 
-  let settingSkills = false, skillRetry = 0, skillSetupIssue = '';
+  let settingSkills = false, skillRetry = 0, skillSetupIssue = '', recoverRetired = true;
   function skills(on, issues, exiting) {
     const library = json(libraryFile, 'the Magpie Library') ?? {};
     if (on && !exiting) {
       const newLink = linkSkills(stage, skillsDir);
-      if ((newLink || library.skillHow?.oleafly !== 'copy') && !settingSkills && Date.now() >= skillRetry) {
+      if ((newLink || skillRetry || library.skillHow?.oleafly !== 'copy') && !settingSkills && Date.now() >= skillRetry) {
         settingSkills = true;
+        skillRetry = 0;
         const app = '/Applications/magpie.app/Contents/MacOS/magpie';
         const args = library.skillHow?.oleafly !== 'copy' ? ['skill', 'how', 'copy', 'oleafly'] : ['sync'];
-        execFile(fs.existsSync(app) ? app : 'magpie', ['library', ...args], {
+        childProcess.execFile(fs.existsSync(app) ? app : 'magpie', ['library', ...args], {
           env: { ...process.env, MAGPIE_OLEAFLY_SYNCING_SKILLS: '1' }, timeout: 30000,
         }, error => {
           settingSkills = false;
@@ -171,12 +174,13 @@ function startBridge(directory, report) {
       }
     }
     if (skillSetupIssue) issues.push(skillSetupIssue);
-    if (on) return;
+    if (on && !recoverRetired) return;
     const link = path.join(stage, 'skills');
-    if (fs.lstatSync(link, { throwIfNoEntry: false })?.isSymbolicLink() && fs.readlinkSync(link) === skillsDir) {
+    if (!on && fs.lstatSync(link, { throwIfNoEntry: false })?.isSymbolicLink() && fs.readlinkSync(link) === skillsDir) {
       fs.unlinkSync(link);
     }
-    const result = removeSkillCopies({ skillsDir, librarySkillsDir, library });
+    const result = removeSkillCopies({ skillsDir, librarySkillsDir, library, retiredOnly: on });
+    recoverRetired = false;
     for (const issue of result.issues) issues.push(`Skill ${issue.name}. ${issue.message}`);
   }
 
@@ -184,8 +188,9 @@ function startBridge(directory, report) {
     const issues = [];
     try {
       const current = signature();
-      if (!exiting && previous === current && !nextProbe && !skillRetry) return;
+      if (!exiting && previous === current && !nextProbe && (!skillRetry || Date.now() < skillRetry)) return;
       const on = enabled();
+      if (!on) fs.rmSync(mcpFile, { force: true });
       const installed = fs.existsSync(bundle) || fs.existsSync(dataDir) || fs.existsSync(modelFile) ||
         fs.existsSync(path.join(home, '.local/bin/oleafly')) ||
         process.env.PATH?.split(path.delimiter).some(dir => fs.existsSync(path.join(dir, 'oleafly')));
@@ -200,7 +205,7 @@ function startBridge(directory, report) {
         try {
           const rawAddr = process.env.MAGPIE_ADDR;
           const staged = translateMcp(json(mcpFile, 'the Oleafly MCP staging file'),
-            json(libraryFile, 'the Magpie Library') ?? {}, { gatewayUrl: rawAddr && 'http://' + rawAddr });
+            json(libraryFile, 'the Magpie Library') ?? {}, { directory, gatewayUrl: rawAddr && 'http://' + rawAddr });
           mcp = staged.servers;
           for (const issue of staged.issues) issues.push(`MCP ${issue.name}. ${issue.message}`);
         } catch (error) { issues.push(error.message); }
@@ -212,8 +217,12 @@ function startBridge(directory, report) {
       }
       previous = current;
     } catch (error) {
-      issues.push(error.code && !error.code.startsWith('OLEAFLY')
-        ? 'Cannot synchronize Oleafly. Check the configuration directory permissions and retry.' : error.message);
+      if (exiting && error.code === 'OLEAFLY_BUSY' && !enabled()) {
+        issues.push(deferRemoval(dataDir, directory, specs, cleanupSource));
+      } else {
+        issues.push(error.code && !error.code.startsWith('OLEAFLY')
+          ? 'Cannot synchronize Oleafly. Check the configuration directory permissions and retry.' : error.message);
+      }
       previous = undefined;
     }
     publish(issues);
@@ -223,9 +232,12 @@ function startBridge(directory, report) {
   const timer = setInterval(tick, 500);
   timer.unref();
   function stop() {
+    if (stopped) return;
     stopped = true;
+    process.removeListener('exit', stop);
     clearInterval(timer);
-    tick(true);
+    try { tick(true); }
+    finally { fs.closeSync(cleanupSource); }
   }
   process.once('exit', stop);
   return stop;

@@ -1,6 +1,11 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
+const { closeSync, openSync, readFileSync, readSync, statSync } = require('node:fs');
 const { isIPv4 } = require('node:net');
+const { homedir } = require('node:os');
+const path = require('node:path');
+const { isDeepStrictEqual } = require('node:util');
 
 const agent = 'oleafly';
 const hubName = 'magpie';
@@ -53,6 +58,76 @@ function validateMap(values, kind) {
   }
 }
 
+function expandHome(value) {
+  return value.replace(/^~(?=[/\\]|$)/, () => homedir());
+}
+
+// npxDirect selects the installed package's own bin under the Magpie host's working directory.
+function cachedNpxMatches(directory, npx, args, command, stagedArgs) {
+  if (!/(?:^|[/\\])npx(?:-cli)?(?:\.(?:js|cjs|mjs|cmd|bat|exe|ps1))?$/i.test(npx)) return false;
+  const node = path.join(path.dirname(npx), 'node');
+  const index = args.findIndex(arg => arg !== '-y' && arg !== '--yes');
+  if (command !== node || index < 1 || !isDeepStrictEqual(stagedArgs.slice(1), args.slice(index + 1).map(expandHome))) return false;
+  const spec = args[index];
+  const pkg = /^((?:@[a-z0-9][a-z0-9._~-]*\/)?[a-z0-9][a-z0-9._~-]*)(?:@[A-Za-z0-9._~^<>=*| -]+)?$/.exec(spec);
+  if (!pkg) return false;
+  const hash = createHash('sha256').update(spec).digest('hex').slice(0, 16);
+  const root = path.join(directory, 'mcp-npm', hash, 'node_modules', pkg[1]);
+  try {
+    if (/[/\\]/.test(npx) && !statSync(path.resolve(directory, node)).isFile()) return false;
+    const { bin } = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
+    let rel = bin;
+    if (object(bin)) {
+      const bins = Object.values(bin);
+      if (!strings(bins)) return false;
+      rel = bins.length === 1 ? bins[0] : bin[path.basename(pkg[1])];
+    }
+    if (typeof rel !== 'string' || !rel || path.isAbsolute(rel)) return false;
+    const file = path.join(root, rel);
+    if (file !== stagedArgs[0] || !file.startsWith(root + path.sep) || !statSync(file).isFile()) return false;
+    if (/\.(?:cjs|mjs|js)$/i.test(file)) return true;
+    const fd = openSync(file, 'r');
+    try {
+      const head = Buffer.alloc(128);
+      const size = readSync(fd, head, 0, head.length, 0);
+      return /^#![^\n]*node/.test(head.toString('utf8', 0, size));
+    } finally { closeSync(fd); }
+  } catch { return false; }
+}
+
+function matchesStdio(assigned, command, args, env, directory) {
+  const argv = assigned.args ?? [];
+  const vars = assigned.env ?? {};
+  if (typeof assigned.command !== 'string' || !strings(argv) || !object(vars)) return false;
+  if (Object.keys(vars).length !== Object.keys(env).length) return false;
+  for (const [key, value] of Object.entries(vars)) {
+    if (typeof value !== 'string' || !Object.hasOwn(env, key)) return false;
+    if (env[key] !== expandHome(value).replace(/%(?:HOME|USERPROFILE)%/gi, () => homedir())) return false;
+  }
+  if (command === expandHome(assigned.command) && isDeepStrictEqual(args, argv.map(expandHome))) return true;
+  return cachedNpxMatches(directory, assigned.command, argv, command, args);
+}
+
+function headerMap(headers) {
+  if (!object(headers)) throw new Error('Invalid MCP header map. Check it in Magpie Library.');
+  const entries = Object.entries(headers);
+  const map = new Map(entries.map(([key, value]) => [key.toLowerCase(), value]));
+  if (map.size !== entries.length) throw new Error('Duplicate MCP header. Check it in Magpie Library.');
+  return map;
+}
+
+function assignedHeaders(assigned, relay) {
+  const headers = headerMap(assigned?.headers ?? {});
+  if (assigned?.account) {
+    const accounts = assigned.accounts;
+    const matches = Array.isArray(accounts) ? accounts.filter(a => a?.id === assigned.account) : [];
+    if (matches.length !== 1) throw new Error('Invalid MCP account selection. Check it in Magpie Library.');
+    for (const [key, value] of headerMap(matches[0].headers ?? {})) headers.set(key, value);
+  }
+  if (relay) headers.delete('authorization');
+  return headers;
+}
+
 function validateEndpoint(url, assigned, origin) {
   if (!assigned) {
     if (url.origin !== origin || url.pathname !== `${hubPath}/${agent}` || url.search) {
@@ -78,9 +153,14 @@ function validateEndpoint(url, assigned, origin) {
   if (url.href !== expected?.href && !relay) {
     throw new Error('MCP endpoint differs from the Library assignment. Resync MCP in Magpie Library.');
   }
+  // Oleafly stores URLs verbatim. Limit direct queries to the numeric version selector.
+  if (url.search && !/^\?version=\d{1,3}(?:\.\d{1,3}){0,2}$/.test(url.search)) {
+    throw new Error('Oleafly stores MCP URLs in plaintext. Route this query through Magpie or use header authentication.');
+  }
+  return relay && url.href !== expected?.href;
 }
 
-function translateEntry(name, entry, assigned, origin) {
+function translateEntry(name, entry, assigned, origin, directory) {
   if (!serverName(name)) throw new Error('Oleafly MCP names use up to 64 letters, digits, dots, hyphens, or underscores. Rename the server in Magpie Library.');
   if (!object(entry)) throw new Error('Missing or invalid staged MCP entry. Resync MCP in Magpie Library.');
   const { type, command, args = [], env = {}, headers = {} } = entry;
@@ -100,10 +180,13 @@ function translateEntry(name, entry, assigned, origin) {
     if (!strings(args) || args.length > 128 || args.some((arg) => Buffer.byteLength(arg) > 8192 || /[\0\p{Cs}]/u.test(arg))) {
       throw new Error('Invalid MCP command arguments. Check them in Magpie Library.');
     }
-    if ([command, ...args].some((value) => value.includes('${'))) {
+    if ([command, ...args].some((value) => /\$\{|\$[a-z_]|%(?:HOME|USERPROFILE)%/i.test(value))) {
       throw new Error('Oleafly cannot expand MCP command variables. Route the server through Magpie or update its command in Library.');
     }
     validateMap(env, 'env');
+    if (!matchesStdio(assigned, command, args, env, directory)) {
+      throw new Error('MCP command, arguments, or environment differ from the Library assignment. Resync MCP or route it through Magpie.');
+    }
     return { name, transport: 'stdio', command: command.trim(), args: [...args], env: { ...env } };
   }
 
@@ -116,14 +199,17 @@ function translateEntry(name, entry, assigned, origin) {
   } catch {
     throw new Error('Invalid MCP URL path. Check it in Magpie Library.');
   }
-  validateEndpoint(url, assigned, origin);
+  const relay = validateEndpoint(url, assigned, origin);
   validateMap(headers, 'header');
+  if (!isDeepStrictEqual(headerMap(headers), assignedHeaders(assigned, relay))) {
+    throw new Error('MCP headers differ from the Library assignment. Resync MCP in Magpie Library.');
+  }
   return { name, transport: 'remote', url: url.href, headers: { ...headers } };
 }
 
 // Use library.json alongside Claude-format staging because Magpie omits tool restrictions for plugin agents.
 // Servers can contain credentials and are inputs to the reconciler's secret transaction.
-function translateMcp(staging, library, { gatewayUrl } = {}) {
+function translateMcp(staging, library, { gatewayUrl, directory = process.cwd() } = {}) {
   if (staging !== null && (!object(staging) || Object.keys(staging).some((key) => key !== 'mcpServers') ||
       (Object.hasOwn(staging, 'mcpServers') && !object(staging.mcpServers)))) {
     throw new Error('Invalid Oleafly MCP staging document. Resync MCP in Magpie Library.');
@@ -156,7 +242,9 @@ function translateMcp(staging, library, { gatewayUrl } = {}) {
   const issues = [];
   const report = (name, message) => issues.push({ name: name.replace(/\p{Cc}/gu, '\uFFFD').slice(0, 96), message });
   const assigned = [...libraryEntries.values()].filter((item) => item.agents?.includes(agent) && !item.hidden);
-  const routed = library.mcpHub ? assigned.filter((item) => item.hub !== 'direct') : [];
+  const wantsHub = library.mcpHub && assigned.some(item => item.hub !== 'direct');
+  const collision = libraryEntries.has(hubName) || (object(stage[hubName]) && !owned.has(hubName));
+  const useHub = wantsHub && !collision;
   const plugins = new Map();
   const offered = [...(library.pluginsOffered ?? []), ...[...libraryEntries.values()].map((item) => item.plugin).filter(Boolean)];
   for (const plugin of offered) {
@@ -171,21 +259,16 @@ function translateMcp(staging, library, { gatewayUrl } = {}) {
       return;
     }
     try {
-      servers.push(translateEntry(name, stage[name], item, origin));
+      servers.push(translateEntry(name, stage[name], item, origin, directory));
     } catch (error) {
       report(name, error.message);
     }
   }
 
-  if (routed.length > 0) {
-    if (libraryEntries.has(hubName)) {
-      report(hubName, 'An MCP server named magpie conflicts with the Router. Rename that server in Magpie Library.');
-    } else {
-      add(hubName);
-    }
-  }
+  if (useHub) add(hubName);
+  else if (wantsHub) report(hubName, 'An MCP server named magpie conflicts with the Router. Magpie stages individual assignments.');
   for (const item of assigned) {
-    if (library.mcpHub && item.hub !== 'direct') continue;
+    if (useHub && item.hub !== 'direct') continue;
     if (item.plugin && plugins.get(pluginPrefix(item.plugin)) === null) {
       report(item.name, 'Magpie’s direct tool endpoint is shared by multiple plugins. Route this server through Magpie or remove the other plugin.');
       continue;

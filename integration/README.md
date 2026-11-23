@@ -25,7 +25,8 @@ The harness checks Magpie's web Agents picker and Library controls through the i
 - Execute assigned stdio, direct HTTP, and plugin tools with Router off and on. Verify the agent-scoped hub URL and the retained direct entry. Ask Oleafly to call the exact unassigned tool identifier and require a rejection.
 - Import, assign, update, load, and unassign a skill through Library. Verify its reference and binary asset, per-agent copy mode, and same-name user skill preservation.
 - Block a model change with Oleafly's transaction lock and restart the resident host before releasing it. Exercise an unavailable gateway and retry through Agents.
-- Reset the model separately from Library. Preserve and report later edits. Reassign the managed skill before each disable and uninstall check and verify removal of the live copy.
+- Restrict an edited direct MCP entry and check that a fresh Oleafly CLI no longer offers its tool, while the disabled entry retains the local edit.
+- Reset the model separately from Library. Hold Oleafly’s config lock through disable and uninstall, then verify restoration of the later chat selection and removal of the skill copy, managed MCP entries, and staged credential.
 
 ## Observations on 23 November 2026
 
@@ -33,7 +34,7 @@ Tested the installed arm64 Magpie 0.1.4705 and Oleafly 0.4.13 binaries with Bun 
 
 Library copied the skill into the custom Oleafly data directory as a real directory with its reference and binary asset. The CLI loaded the skill and read the updated reference. Magpie preserved the displaced user skill in its Library backup. The transaction-lock interruption kept the previous configuration byte-for-byte. The resident restart applied the pending change after lock release. An unavailable gateway preserved the previous config, and selecting the working route recovered the CLI. Reset retained MCP assignments, and disconnect reported the conflict while preserving a later chat selection, provider, and unrelated MCP edit.
 
-Disable and uninstall each started with a verified managed skill copy. Both removed that copy and the managed MCP entries and left the later user provider usable. **Re-enable through the resident Plugins controls passed.** The separate cross-process CLI check (`--cli`) was intermittent on re-enable. On a failed run, Agents wrote the correct model, gateway, and identity, and refreshing the model catalog left the selection pending. A real call to the fixture plugin tool on the same resident gateway applied it. A separate failed run recovered after restarting the resident process. The harness records re-enable as failed even when recovery allows the uninstall check to proceed.
+Disable and uninstall each started with a verified managed skill copy. Both removed that copy and the managed MCP entries and left the later user provider usable.
 
 The installed web endpoints passed model selection, restart notice, default reset, MCP assignment and removal, and direct-server restriction withholding with a diagnostic. In a separate browser run, the Agents picker applied the first fixture model, and the Library control assigned and removed the direct HTTP server. Switching the plugin off in Plugins restored the original selection. Switching it back on and choosing the second fixture model reached Oleafly. Removing the re-enabled plugin through Plugins restored the original provider and preserved the unrelated MCP server.
 

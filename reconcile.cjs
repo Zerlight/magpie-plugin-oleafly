@@ -1,8 +1,8 @@
 'use strict';
 
 const fs = require('node:fs');
-const { spawnSync } = require('node:child_process');
-const { createCipheriv, createDecipheriv, createHmac, randomBytes } = require('node:crypto');
+const { spawn, spawnSync } = require('node:child_process');
+const { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } = require('node:crypto');
 const { homedir } = require('node:os');
 const { join, resolve } = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
@@ -10,6 +10,7 @@ const { isDeepStrictEqual } = require('node:util');
 const PROVIDER = 'magpie-oleafly';
 const CONFIG = 'config.json';
 const STATE = '.magpie-oleafly-state.json';
+const CLEANUP_NOTE = '.magpie-oleafly-cleanup.txt';
 const KEY = 'ai-secrets.key';
 const AI_SECRETS = 'ai-secrets.json';
 const MCP_SECRETS = 'mcp-server-secrets.json';
@@ -18,6 +19,11 @@ const SECRET_REF = /^__stored__:v1:[0-9a-f]{64}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 const NAME = /^[a-zA-Z0-9_.-]{1,64}$/;
 const MAX_CONFIG_BYTES = 4 * 1024 * 1024;
+const MAX_MCP_SERVERS = 64;
+// Oleafly 0.4.13's native provider catalog is independent of ai_custom_providers.
+const BUILTIN_PROVIDERS = new Set([
+  'openai', 'anthropic', 'google', 'zai', 'groq', 'openrouter', 'deepseek', 'mistral', 'xai', 'perplexity', 'ollama',
+]);
 const MODEL_SLOTS = ['selection', 'provider', 'catalog', 'key'];
 const PROTECTED_HEADERS = new Set([
   'accept', 'connection', 'content-length', 'content-type', 'host', 'mcp-method',
@@ -30,7 +36,7 @@ function fail(message, code = 'OLEAFLY_CONFIG') {
   throw Object.assign(new ReconcileError(message), { code });
 }
 
-const object = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+const object = value => value !== null && typeof value === 'object' && !Array.isArray(value) && !JSON.isRawJSON(value);
 const string = value => typeof value === 'string';
 const textMap = value => object(value) && Object.values(value).every(string);
 const control = value => /[\u0000-\u001f\u007f-\u009f]/u.test(value);
@@ -56,7 +62,10 @@ function readFile(root, name, maximum = Infinity) {
 
 function parseObject(bytes, name) {
   try {
-    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    // AppConfig includes u64 revisions and timestamps. Keep native number tokens through every config write.
+    const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes), name === CONFIG
+      ? (_, item, context) => typeof item === 'number' ? JSON.rawJSON(context.source) : item
+      : undefined);
     if (object(value)) return value;
   } catch {
     // Parser diagnostics can include credentials from the source text.
@@ -98,7 +107,7 @@ function replace(root, name, bytes) {
   }
 }
 
-function withLock(root, name, run) {
+function withLock(root, name, run, wait = false) {
   let fd;
   try {
     fd = fs.openSync(join(root, name), fs.constants.O_RDWR | fs.constants.O_CREAT |
@@ -107,7 +116,7 @@ function withLock(root, name, run) {
 
     // fs4 uses flock on Unix. The inherited open file description keeps the lock in this process.
     const mac = process.platform === 'darwin';
-    const args = mac ? ['-s', '-t', '0', '3'] : ['-x', '-n', '3'];
+    const args = mac ? (wait ? ['-s', '3'] : ['-s', '-t', '0', '3']) : (wait ? ['-x', '3'] : ['-x', '-n', '3']);
     const result = spawnSync(mac ? '/usr/bin/lockf' : '/usr/bin/flock', args,
       { stdio: ['ignore', 'ignore', 'ignore', fd] });
     if (result.status === (mac ? 75 : 1)) {
@@ -258,7 +267,8 @@ function readState(raw) {
   const slot = name => MODEL_SLOTS.includes(name) || name.startsWith('mcp:') && NAME.test(name.slice(4));
   const owned = value => object(value) && Object.entries(value).every(([name, record]) => slot(name) &&
     (name === 'selection' ? object(record) && hash(record.last) && Array.isArray(record.previous) &&
-      record.previous.length === 2 && record.previous.every(value => value === null || string(value)) : hash(record)));
+      record.previous.length === 2 && record.previous.every(value => value === null || string(value))
+      : hash(record) || name.startsWith('mcp:') && object(record) && hash(record.withdrawn)));
   const pending = state.pending;
   if (state.version === 1 && owned(state.owned) && (pending === undefined || object(pending) && owned(pending.owned) &&
       object(pending.effects) && Object.entries(pending.effects).every(([name, value]) => slot(name) && (value === null || hash(value))) &&
@@ -407,8 +417,14 @@ function reconcileLocked(root, model, mcp, rawState) {
         modelConflict('chat', 'edited', 'Oleafly’s chat model changed outside Magpie. The current chat selection was kept.');
         record('selection', actual('selection'), null);
       } else {
+        const [provider] = owned.selection.previous;
+        const missing = provider && !BUILTIN_PROVIDERS.has(provider) && !provider.startsWith('acp:') &&
+          !cfg.ai_custom_providers?.some(entry => entry.id === provider);
+        if (missing) {
+          modelConflict('chat', 'missing-provider', 'The previous Oleafly chat provider was removed. Chat was reset to the Oleafly default.');
+        }
         for (const [index, field] of ['ai_provider', 'ai_model'].entries()) {
-          const previous = owned.selection.previous[index];
+          const previous = missing ? null : owned.selection.previous[index];
           if (previous === null) delete cfg[field];
           else cfg[field] = previous;
         }
@@ -435,24 +451,58 @@ function reconcileLocked(root, model, mcp, rawState) {
   }
 
   if (mcp) {
-    const names = new Set([...mcp.keys(), ...Object.keys(owned).filter(slot => slot.startsWith('mcp:')).map(slot => slot.slice(4))]);
-    for (const name of names) {
+    // Withdraw first so a removed server can make room for a new assignment in the same transaction.
+    const withdrawn = Object.keys(owned).filter(slot => slot.startsWith('mcp:'))
+      .map(slot => slot.slice(4)).filter(name => !mcp.has(name));
+    for (const name of [...withdrawn, ...mcp.keys()]) {
       const slot = `mcp:${name}`;
       const matches = servers(name);
       const wanted = mcp.get(name);
       const present = actual(slot);
-      if (!wanted && present === null) {
+      if (present === null && (!wanted || owned[slot]?.withdrawn)) {
         record(slot, null);
+        if (!wanted) continue;
+      }
+      let owner = owned[slot];
+      if (owner?.withdrawn && matches.length === 1 && present !== owner.withdrawn) {
+        const live = mcpValues(matches[0], secrets);
+        // After withdrawal only the enable switch belongs to reconciliation. A different same-name entry is local.
+        if (mark([{ ...live, enabled: !live.enabled }]) !== owner.withdrawn) {
+          record(slot, present, null);
+          owner = undefined;
+        }
+      }
+      const next = mark(wanted ? [wanted] : undefined);
+      if (!wanted && owner && matches.length === 1 && present !== owner) {
+        if (matches[0].enabled !== false) {
+          matches[0].enabled = false;
+          configChanged = true;
+        }
+        record(slot, actual(slot), { withdrawn: owner.withdrawn ?? present });
+        conflict('mcp', name, 'edited',
+          `Withdrawn Oleafly MCP server '${name}' is disabled. Its local edits were kept. Rename or remove it to apply a different assignment.`);
         continue;
       }
-      if (present !== (owned[slot] ?? null)) {
-        const reason = owned[slot] ? 'edited' : 'collision';
+      if (wanted && owner?.withdrawn === next && matches.length === 1) {
+        if (present !== next) {
+          matches[0].enabled = wanted.enabled;
+          configChanged = true;
+        }
+        record(slot, next);
+        continue;
+      }
+      if (present !== (owner ?? null)) {
+        const reason = owner && matches.length <= 1 ? 'edited' : 'collision';
         conflict('mcp', name, reason,
           `Oleafly MCP server '${name}' differs from the managed assignment. Review or rename it in Oleafly and retry.`);
         continue;
       }
-      const next = mark(wanted ? [wanted] : undefined);
       if (present === next) continue;
+      if (wanted && !matches.length && (cfg.mcp_servers?.length ?? 0) >= MAX_MCP_SERVERS) {
+        conflict('mcp', name, 'capacity',
+          `Oleafly supports up to ${MAX_MCP_SERVERS} MCP servers. Remove a server to make room for '${name}'.`);
+        continue;
+      }
       for (const ref of references(matches)) if (SECRET_REF.test(ref)) garbage.add(ref);
       let replacement;
       if (wanted) {
@@ -559,4 +609,52 @@ function reconcile(options = {}) {
   }
 }
 
-module.exports = { reconcile };
+const specDigest = spec => createHash('sha256').update(spec).digest('hex');
+
+function deferRemoval(root, directory, specs, sourceFd) {
+  const ticket = randomBytes(16).toString('hex');
+  replace(root, CLEANUP_NOTE, ticket + '\nWaiting for Oleafly to release its configuration lock.\n');
+  const child = spawn(process.execPath, ['-', root, directory, ticket, ...Array.from(specs, specDigest)], {
+    cwd: '/', detached: true, stdio: [sourceFd, 'ignore', 'ignore'],
+  });
+  child.unref();
+  return `Oleafly cleanup is waiting for its configuration lock. Any conflict will be recorded in ${join(root, CLEANUP_NOTE)}.`;
+}
+
+function cancelPendingRemoval(root) {
+  const note = readFile(root, CLEANUP_NOTE);
+  if (note && /^[0-9a-f]{32}\n/.test(note.toString())) {
+    fs.rmSync(join(root, CLEANUP_NOTE), { force: true });
+  }
+}
+
+module.exports = { reconcile, deferRemoval, cancelPendingRemoval };
+
+// Magpie can unload the package while Oleafly is still writing. The host passes
+// this already-open module on stdin so this one cleanup can finish after unload.
+if (process.argv[1] === '-' && module.filename.endsWith('/[stdin]')) {
+  const [root, directory, ticket, ...specs] = process.argv.slice(2);
+  const current = () => readFile(root, CLEANUP_NOTE)?.toString().startsWith(ticket + '\n');
+  try {
+    withLock(root, '.config-store.lock', () => withLock(root, '.secret-store.lock', () => {
+      if (!current()) return;
+      const list = parseObject(readFile(directory, 'plugins.json'), 'plugins.json');
+      if (!Array.isArray(list.plugins)) fail('Check the Magpie plugin list before retrying cleanup.');
+      if (!list.plugins.some(row => !row.off && specs.includes(specDigest(row.spec)))) {
+        const state = readFile(root, STATE);
+        if (state) {
+          const result = reconcileLocked(root, null, new Map(), state);
+          if (result.conflicts.length) {
+            replace(root, CLEANUP_NOTE, result.conflicts.map(issue => issue.message).join('\n') + '\n');
+            return;
+          }
+        }
+      }
+      fs.rmSync(join(root, CLEANUP_NOTE), { force: true });
+    }, true), true);
+  } catch (error) {
+    if (current()) replace(root, CLEANUP_NOTE, (error instanceof ReconcileError ? error.message :
+      'Oleafly cleanup could not finish. Check permissions and retry removal in Magpie.') + '\n');
+    process.exitCode = 1;
+  }
+}

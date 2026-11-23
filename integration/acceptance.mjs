@@ -203,23 +203,28 @@ async function resetModel(original) {
   await eventually(() => config().ai_provider === original.ai_provider && config().ai_model === original.ai_model,
     'Agent default did not restore the original selection');
 }
-async function interruptBeforeWrite(from, to) {
+async function withConfigLock(action) {
   const lock = spawn('/usr/bin/lockf', ['-k', dir('oleafly/.config-store.lock'),
     '/bin/sh', '-c', 'echo locked; read -r release'], { cwd: dir('project'), env, stdio: ['pipe', 'pipe', 'ignore'] });
   const closed = once(lock, 'close');
   try {
     const ready = await Promise.race([once(lock.stdout, 'data'), closed, delay(2000)]);
     check(ready?.[0]?.toString().trim() === 'locked', 'fixture failed to hold Oleafly’s config lock');
+    await action();
+  } finally {
+    lock.stdin.end();
+    await closed;
+  }
+}
+async function interruptBeforeWrite(from, to) {
+  await withConfigLock(async () => {
     const before = readFileSync(configPath);
     await mg('oleafly', to);
     await delay(750);
     check(readFileSync(configPath).equals(before) && config().ai_model === from,
       'reconciliation modified config while the Oleafly lock was held');
     await stopHost();
-  } finally {
-    lock.stdin.end();
-    await closed;
-  }
+  });
   await startHost();
   await refreshHost();
   await eventually(() => config().ai_model === to, 'resident restart did not apply the pending model after lock release');
@@ -298,7 +303,15 @@ async function mcpMatrix(routed) {
 async function detached(original, action) {
   await mg('library', 'skill', 'agents', skill, 'oleafly');
   await eventually(() => copyIs('library-skill-v2'), 'managed skill was not present before plugin ' + action);
-  await pluginAction(action);
+  await mg('library', 'mcp', 'set', 'remoteprobe', 'header=Authorization=Bearer fixture-staging-header');
+  const staged = dir('home/.magpie-oleafly/mcp.json');
+  await eventually(() => existsSync(staged) && readFileSync(staged, 'utf8').includes('fixture-staging-header'),
+    'credential fixture was missing before plugin ' + action);
+  await withConfigLock(async () => {
+    await pluginAction(action);
+    await delay(2200);
+    check(config().ai_provider !== original.ai_provider, 'cleanup changed the native config under its lock');
+  });
   await refreshHost();
   await eventually(() => config().ai_provider === original.ai_provider && config().ai_model === original.ai_model &&
     config().ai_custom_providers.length === original.ai_custom_providers.length &&
@@ -309,16 +322,8 @@ async function detached(original, action) {
   check(Boolean(library().mcpHub), 'plugin ' + action + ' changed the global MCP Router setting');
   await conversation(models[1], ['--no-mcp']);
   await eventually(() => !existsSync(skillDestination), 'plugin ' + action + ' left an owned skill copy');
-}
-async function callResidentPluginTool() {
-  const response = await fetch('http://' + env.MAGPIE_ADDR + '/mcp/magpie/tools/' + pluginFixtureName, {
-    method: 'POST', headers: { 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' },
-    body: JSON.stringify({
-      jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'pluginprobe', arguments: {} },
-    }),
-    signal: AbortSignal.timeout(7500),
-  });
-  check(response.ok && (await response.text()).includes(toolMarker('pluginprobe')), 'resident fixture plugin tool call failed');
+  check(!existsSync(staged) || !readFileSync(staged, 'utf8').includes('fixture-staging-header'),
+    'plugin ' + action + ' retained an assigned credential in staging');
 }
 async function pluginAction(action) {
   if (!webAddress) return mg('plugin', action, packageDir);
@@ -370,7 +375,19 @@ async function exerciseWeb(original) {
     'restricted direct MCP entry was not withheld and identified');
   await request('/api/library/servers/tools', { name: 'remoteprobe', names: [] });
   await eventually(() => mcp('remoteprobe'), 'clearing the restriction did not restore the direct entry');
+  const edited = config();
+  edited.mcp_servers.find(entry => entry.name === 'remoteprobe').headers = { 'X-Local-Edit': 'fixture' };
+  replaceConfig(edited);
+  await request('/api/library/servers/tools', { name: 'remoteprobe', names: ['remoteprobe'] });
+  await eventually(() => mcp('remoteprobe')?.enabled === false && mcp('remoteprobe')?.headers?.['X-Local-Edit'] === 'fixture',
+    'restricted direct MCP kept running or lost its local edit');
+  const available = await conversation(models[0], mcpPermissions);
+  check(!available.some(name => name.includes('remoteprobe')), 'restricted direct tool was still available to a fresh CLI');
   await request('/api/library/servers/agents', { name: 'remoteprobe', agents: [] });
+  const resolved = config();
+  resolved.mcp_servers = resolved.mcp_servers.filter(entry => entry.name !== 'remoteprobe');
+  replaceConfig(resolved);
+  await request('/api/library/servers/tools', { name: 'remoteprobe', names: [] });
   await eventually(() => !mcp('remoteprobe'), 'Magpie web Library removal did not reach Oleafly');
   await request('/api/set', { agent: 'oleafly', field: 'model', value: '' });
   await eventually(() => config().ai_provider === original.ai_provider && config().ai_model === original.ai_model,
@@ -574,28 +591,14 @@ try {
       await setModel(group);
       await detached(later, 'off');
       pass('resident plugin disable restored the later usable model and removed owned MCP and skill entries');
-      stage = 'plugin re-enable and uninstall';
+      stage = 'plugin re-enable';
       await pluginAction('on');
-      // This makes the still-running Magpie reload its plugin catalog after a CLI list change.
       await refreshHost();
       check((await mg('ls')).split('\n').filter(line => /^\s+Oleafly\b/i.test(line)).length === 1,
         're-enable did not restore the detected agent');
-      try {
-        await setModel(group);
-      } catch (error) {
-        fail('re-enable in the running host', error);
-        try {
-          await callResidentPluginTool();
-          await eventually(() => config().ai_model === group, 'a resident plugin tool call did not recover the connection');
-          pass('a real plugin tool call woke the resident host and applied the pending selection');
-        } catch {
-          await stopHost();
-          await startHost();
-          await setModel(group);
-          pass('a resident restart recovered the re-enabled connection');
-        }
-      }
+      await setModel(group);
       await conversation(models[0], ['--no-mcp']);
+      stage = 'plugin uninstall';
       await detached(later, 'rm');
       pass('resident uninstall removed owned MCP and skill entries and left the later provider usable');
     }

@@ -26,7 +26,7 @@ function fixture(t) {
     owned.push(name);
     return directory;
   }
-  const sync = () => removeSkillCopies({ skillsDir, librarySkillsDir,
+  const sync = (options) => removeSkillCopies({ skillsDir, librarySkillsDir, ...options,
     library: { applied: { oleafly: { skills: owned } } } });
   return { at, copy, owned, root, sync };
 }
@@ -60,6 +60,77 @@ test('cleanup preserves a bundled folder with Oleafly’s provenance marker', (t
   fs.writeFileSync(at('bundled', '.oleafly-first-party'), 'oleafly-first-party-v1\n');
   assert.deepEqual(sync(), { removed: [], issues: [] });
   assert.ok(fs.existsSync(at('bundled')));
+});
+
+test('retry completes an interrupted retirement even after the live skills directory is gone', (t) => {
+  const { at, copy, root, sync } = fixture(t);
+  copy('pending');
+  const failure = t.mock.method(fs, 'rmSync', () => { throw new Error('busy'); });
+  const paused = sync();
+  failure.mock.restore();
+  const [retired] = fs.readdirSync(root).filter(name => name.startsWith('.magpie-oleafly-retired-'));
+  assert.equal(paused.issues[0].name, 'pending');
+  assert.ok(paused.issues[0].message.includes(path.join(root, retired)));
+  assert.ok(fs.existsSync(path.join(root, retired, 'pending', 'SKILL.md')));
+  fs.rmdirSync(at(''));
+
+  assert.deepEqual(sync(), { removed: ['pending'], issues: [] });
+  assert.ok(!fs.existsSync(path.join(root, retired)));
+  assert.deepEqual(sync(), { removed: [], issues: [] });
+});
+
+test('restart recovers the retired copy and preserves a newly applied live copy of the same skill', (t) => {
+  const { at, copy, root, sync } = fixture(t);
+  const retired = fs.mkdtempSync(path.join(root, '.magpie-oleafly-retired-'));
+  fs.renameSync(copy('notes'), path.join(retired, 'notes'));
+  copy('notes');
+
+  assert.deepEqual(sync({ retiredOnly: true }), { removed: ['notes'], issues: [] });
+  assert.ok(!fs.existsSync(retired));
+  assert.equal(fs.readFileSync(at('notes', 'SKILL.md'), 'utf8'), 'instructions');
+});
+
+test('retired copies with edits, missing ownership or a foreign receipt remain available for review', (t) => {
+  const { copy, owned, root, sync } = fixture(t);
+  const paths = new Map();
+  for (const name of ['edited', 'foreign', 'partial', 'unowned']) {
+    const retired = fs.mkdtempSync(path.join(root, '.magpie-oleafly-retired-'));
+    const directory = path.join(retired, name);
+    fs.renameSync(copy(name, name === 'foreign' ? '/other/library' : undefined), directory);
+    paths.set(name, directory);
+  }
+  owned.pop();
+  fs.writeFileSync(path.join(paths.get('edited'), 'SKILL.md'), 'my notes');
+  fs.unlinkSync(path.join(paths.get('partial'), '.magpie-library'));
+
+  const result = sync();
+  assert.deepEqual(result.removed, []);
+  assert.deepEqual(result.issues.map(issue => issue.name).sort(), [...paths.keys()]);
+  for (const { name, message } of result.issues) {
+    assert.ok(message.includes(path.dirname(paths.get(name))));
+    assert.ok(fs.existsSync(path.join(paths.get(name), 'SKILL.md')));
+  }
+  assert.equal(fs.readFileSync(path.join(paths.get('edited'), 'SKILL.md'), 'utf8'), 'my notes');
+  assert.deepEqual(sync(), result);
+});
+
+test('retry clears an empty retirement directory after the last copy was removed', (t) => {
+  const { root, sync } = fixture(t);
+  const empty = fs.mkdtempSync(path.join(root, '.magpie-oleafly-retired-'));
+  assert.deepEqual(sync(), { removed: [], issues: [] });
+  assert.ok(!fs.existsSync(empty));
+});
+
+test('recovery never follows a linked retirement directory', (t) => {
+  const { at, copy, root, sync } = fixture(t);
+  copy('notes');
+  const link = path.join(root, '.magpie-oleafly-retired-ABC123');
+  fs.symlinkSync(at(''), link);
+  const result = sync({ retiredOnly: true });
+  assert.deepEqual(result.removed, []);
+  assert.ok(result.issues.some(issue => issue.message.includes(link)));
+  assert.ok(fs.lstatSync(link).isSymbolicLink());
+  assert.ok(fs.existsSync(at('notes', 'SKILL.md')));
 });
 
 test('refuses linked roots and never follows a linked skill or marker', (t) => {

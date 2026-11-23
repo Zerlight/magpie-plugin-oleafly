@@ -1,0 +1,5 @@
+node_modules/
+coverage/
+/magpie-plugin-oleafly-*.tgz
+npm-debug.log*
+.DS_Store

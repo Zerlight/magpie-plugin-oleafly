@@ -102,6 +102,47 @@ test('connect, switch to a routing group, repeat, and restore only the model con
   assert.deepEqual(f.apply({ model: null, mcp: [] }), { changed: false, conflicts: [] });
 });
 
+test('reset uses native chat defaults when the previous custom provider was deleted', t => {
+  const f = fixture(t);
+  f.apply({ model });
+  const cfg = f.read();
+  cfg.ai_custom_providers = cfg.ai_custom_providers.filter(p => p.id !== local.id);
+  f.write(cfg);
+  const result = f.apply({ model: null });
+  assert.deepEqual(result.conflicts.map(({ id, reason }) => [id, reason]), [['chat', 'missing-provider']]);
+  const after = f.read();
+  assert.equal(after.ai_provider, undefined);
+  assert.equal(after.ai_model, undefined);
+  assert.deepEqual(after.ai_custom_providers, []);
+  assert.deepEqual(after.ai_provider_models, original.ai_provider_models);
+  assert.deepEqual(after.ai_tools_model, tools);
+  assert.deepEqual(f.apply({ model: null }), { changed: false, conflicts: [] });
+});
+
+test('reset restores implicit, built-in and ACP selections without a custom provider record', t => {
+  for (const selection of [{}, { ai_provider: '', ai_model: '' }, { ai_provider: 'zai', ai_model: 'saved' },
+    { ai_provider: 'acp:claude', ai_model: 'default' }]) {
+    const f = fixture(t, selection);
+    f.apply({ model });
+    assert.deepEqual(f.apply({ model: null }), { changed: true, conflicts: [] });
+    const { ai_custom_providers, ai_provider_models, ...restored } = f.read();
+    assert.deepEqual(restored, selection);
+  }
+});
+
+test('config writes preserve exact native integers, including the maximum u64 revision', t => {
+  const f = fixture(t, null);
+  fs.writeFileSync(f.path('config.json'), '{"cli_settings_revision":18446744073709551615,' +
+    '"ai_model_lists_refreshed_at":{"openai":9007199254740993},"extra":[-9223372036854775807,"9007199254740993"]}');
+  for (const desired of [{ model }, { mcp: [mcp] }, { model: null, mcp: [] }]) {
+    assert.equal(f.apply(desired).changed, true);
+    const raw = fs.readFileSync(f.path('config.json'), 'utf8');
+    assert.match(raw, /"cli_settings_revision":\s*18446744073709551615\b/);
+    assert.match(raw, /"openai":\s*9007199254740993\b/);
+    assert.match(raw, /\[\s*-9223372036854775807,\s*"9007199254740993"\s*\]/);
+  }
+});
+
 test('stores MCP headers and env in Oleafly envelopes and survives Oleafly reissuing a marker', t => {
   const f = fixture(t);
   const stdio = { name: 'direct', transport: 'stdio', command: '/usr/bin/true', args: ['two words'], env: { TOKEN: 'stdio-secret', EMPTY: '' } };
@@ -177,6 +218,109 @@ test('disconnect keeps concurrent selections and edited MCP entries and cleans o
   assert.deepEqual([after.ai_provider, after.ai_model], [newProvider.id, 'my-new-model']);
   assert.deepEqual(after.mcp_servers, cfg.mcp_servers.slice(0, 2));
   assert.equal(f.apply({ model: null, mcp: [] }).changed, false);
+  assert.deepEqual(f.apply({ mcp: [mcp] }).conflicts.map(c => c.reason), ['edited']);
+  assert.equal(f.read().mcp_servers[1].enabled, false);
+});
+
+test('a full assignment withdrawing an edited direct server disables only that server and can resume it', t => {
+  const f = fixture(t);
+  const direct = { ...mcp, name: 'direct' };
+  f.apply({ mcp: [direct] });
+  const cfg = f.read();
+  const live = cfg.mcp_servers[1];
+  delete live.enabled; // Native default is enabled.
+  live.url += '/local';
+  f.write(cfg);
+  const encrypted = fs.readFileSync(f.path('mcp-server-secrets.json'));
+  assert.deepEqual(f.apply({}), { changed: false, conflicts: [] });
+  assert.throws(() => f.apply({ mcp: [existingServer, {}] }), /invalid name or transport/);
+  assert.deepEqual(f.read(), cfg);
+
+  const policy = { mcp: [existingServer] }; // The full desired set withholds the direct server.
+  const first = f.apply(policy);
+  assert.equal(first.changed, true);
+  assert.deepEqual(first.conflicts.map(({ id, reason }) => [id, reason]), [['direct', 'edited'], ['existing', 'collision']]);
+  assert.match(first.conflicts[0].message, /disabled/);
+  assert.deepEqual(f.read().mcp_servers, [existingServer, { ...live, enabled: false }]);
+  assert.deepEqual(fs.readFileSync(f.path('mcp-server-secrets.json')), encrypted);
+  assert.deepEqual(f.apply(policy), { changed: false, conflicts: first.conflicts });
+  assert.equal(f.apply({ mcp: [direct] }).conflicts[0].reason, 'edited');
+  const reassigned = { mcp: [{ ...direct, url: live.url }] };
+  assert.deepEqual(f.apply(reassigned), { changed: true, conflicts: [] });
+  assert.deepEqual(f.read().mcp_servers, [existingServer, { ...live, enabled: true }]);
+  assert.deepEqual(f.apply(reassigned), { changed: false, conflicts: [] });
+});
+
+test('withdrawal recovers after config replacement and a renamed local copy frees the assignment name', t => {
+  const f = fixture(t);
+  f.apply({ mcp: [mcp] });
+  const cfg = f.read();
+  cfg.mcp_servers[1].url += '/local';
+  f.write(cfg);
+  interrupted(f, { mcp: [] }, 'after');
+  const retry = f.apply({ mcp: [] });
+  assert.equal(retry.changed, false);
+  assert.deepEqual(retry.conflicts.map(c => c.reason), ['edited']);
+  const disabled = f.read();
+  assert.equal(disabled.mcp_servers[1].enabled, false);
+  disabled.mcp_servers[1].name = 'local-copy';
+  f.write(disabled);
+  assert.deepEqual(f.apply({ mcp: [mcp] }), { changed: true, conflicts: [] });
+  assert.deepEqual(f.read().mcp_servers.slice(0, 2), disabled.mcp_servers);
+  assert.equal(f.read().mcp_servers[2].enabled, true);
+});
+
+test('duplicate live names are ambiguous on withdrawal', t => {
+  const f = fixture(t);
+  f.apply({ mcp: [mcp] });
+  const cfg = f.read();
+  cfg.mcp_servers.push({ ...existingServer, name: mcp.name });
+  f.write(cfg);
+  const result = f.apply({ mcp: [] });
+  assert.equal(result.changed, false);
+  assert.deepEqual(result.conflicts.map(c => c.reason), ['collision']);
+  assert.deepEqual(f.read(), cfg);
+});
+
+test('a local server replacing a withdrawn copy never inherits its ownership', t => {
+  const f = fixture(t);
+  f.apply({ mcp: [mcp] });
+  const cfg = f.read();
+  cfg.mcp_servers[1].url += '/local';
+  f.write(cfg);
+  f.apply({ mcp: [] });
+  const replacement = { ...existingServer, name: mcp.name };
+  cfg.mcp_servers[1] = replacement;
+  f.write(cfg);
+  for (const desired of [[], [replacement]]) {
+    const result = f.apply({ mcp: desired });
+    assert.equal(result.changed, false);
+    assert.deepEqual(result.conflicts.map(c => c.reason), ['collision']);
+    assert.deepEqual(f.read(), cfg);
+  }
+  assert.equal(f.exists(stateFile), false);
+});
+
+test('the native server limit counts local and disabled entries and admits additions after removals', t => {
+  const locals = Array.from({ length: 63 }, (_, i) => ({ ...existingServer, name: 'local-' + i, enabled: false }));
+  const f = fixture(t, { mcp_servers: locals });
+  const direct = { ...existingServer, name: 'direct' };
+  f.apply({ mcp: [direct] });
+  const full = f.read();
+  const blocked = f.apply({ mcp: [mcp, direct] });
+  assert.equal(blocked.changed, false);
+  assert.deepEqual(blocked.conflicts.map(c => [c.id, c.reason]), [[mcp.name, 'capacity']]);
+  assert.deepEqual(f.read(), full);
+  assert.equal(f.exists('mcp-server-secrets.json'), false);
+  assert.deepEqual(f.apply({ mcp: [mcp] }), { changed: true, conflicts: [] });
+  const swapped = f.read().mcp_servers;
+  assert.deepEqual(swapped.slice(0, -1), locals);
+  assert.equal(swapped.at(-1).name, mcp.name);
+  swapped.at(-1).url += '/local';
+  f.write({ mcp_servers: swapped });
+  const stillFull = f.apply({ mcp: [direct] });
+  assert.deepEqual(stillFull.conflicts.map(c => c.reason), ['edited', 'capacity']);
+  assert.deepEqual(f.read().mcp_servers, [...locals, { ...swapped.at(-1), enabled: false }]);
 });
 
 test('an explicit Tools model using the managed provider survives switching and protects its dependency', t => {

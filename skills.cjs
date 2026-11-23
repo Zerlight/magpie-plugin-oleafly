@@ -71,28 +71,64 @@ function copyReceipt(directory, expectedSource) {
   return hash && /^[a-f0-9]{64}\n$/.test(hash) ? { hash: hash.trim(), copiedAt: info.ctimeNs } : null;
 }
 
-function removeSkillCopies({ skillsDir, librarySkillsDir, library }) {
+function removeSkillCopies({ skillsDir, librarySkillsDir, library, retiredOnly = false }) {
   const owned = library?.applied?.oleafly?.skills ?? [];
   if (!Array.isArray(owned) || !owned.every(validId) ||
       !path.isAbsolute(skillsDir) || !path.isAbsolute(librarySkillsDir)) {
     throw new Error('Invalid Oleafly skill cleanup inputs. Check the Oleafly and Magpie Library paths.');
   }
-  const removed = [];
+  const removed = new Set();
   const issues = [];
   const candidates = new Set(owned);
-  if (!candidates.size || !stat(skillsDir)) return { removed, issues };
-
   const root = path.dirname(skillsDir);
-  if (!stat(root)?.isDirectory() || !stat(skillsDir)?.isDirectory() || fs.realpathSync(skillsDir) !== path.join(fs.realpathSync(root), path.basename(skillsDir))) {
+  const dataDir = stat(root);
+  if (!dataDir) return { removed: [], issues };
+  const live = stat(skillsDir);
+  if (!dataDir.isDirectory() || (live && (!live.isDirectory() ||
+      fs.realpathSync(skillsDir) !== path.join(fs.realpathSync(root), path.basename(skillsDir))))) {
     throw new Error('Oleafly’s skills directory is not a real directory in its data folder. Check the skills path before cleanup.');
   }
+
+  function finishRetirement(retired, expected) {
+    let name = expected?.name ?? path.basename(retired);
+    try {
+      const parent = stat(retired);
+      if (!parent) return;
+      if (!parent.isDirectory()) throw new Error('Unexpected retirement path');
+      const entries = fs.readdirSync(retired);
+      if (entries.length > 1) throw new Error('Unexpected retirement contents');
+      if (entries.length) {
+        [name] = entries;
+        const moved = path.join(retired, name);
+        const item = stat(moved);
+        if (!candidates.has(name) || !item?.isDirectory() ||
+            (expected && (expected.name !== name || !sameFile(expected.before, item)))) {
+          throw new Error('Skill ownership changed');
+        }
+        const receipt = copyReceipt(moved, path.join(librarySkillsDir, name));
+        if (!receipt || (expected && (receipt.hash !== expected.hash || receipt.copiedAt !== expected.copiedAt)) ||
+            copyHash(moved, receipt.copiedAt) !== receipt.hash || !sameVersion(parent, stat(retired))) {
+          throw new Error('Cannot verify the retired copy against its Magpie receipt');
+        }
+        fs.rmSync(moved, { recursive: true });
+        removed.add(name);
+      }
+      fs.rmdirSync(retired);
+    } catch (error) {
+      issues.push({ name, message: `Skill cleanup paused (${error.code || error.message}). Review the retained files at ${retired} before retrying.` });
+    }
+  }
+
+  for (const entry of fs.readdirSync(root)) {
+    if (/^\.magpie-oleafly-retired-[A-Za-z0-9]{6}$/.test(entry)) finishRetirement(path.join(root, entry));
+  }
+  if (retiredOnly || !live) return { removed: [...removed], issues };
 
   for (const name of candidates) {
     const directory = path.join(skillsDir, name);
     const before = stat(directory);
     if (!before?.isDirectory()) continue;
     const source = path.join(librarySkillsDir, name);
-    let retired;
     try {
       const receipt = copyReceipt(directory, source);
       if (!receipt) continue;
@@ -101,29 +137,16 @@ function removeSkillCopies({ skillsDir, librarySkillsDir, library }) {
         continue;
       }
 
-      retired = fs.mkdtempSync(path.join(root, '.magpie-oleafly-retired-'));
+      const retired = fs.mkdtempSync(path.join(root, '.magpie-oleafly-retired-'));
       const moved = path.join(retired, name);
       // Recheck after unregistration so a concurrent replacement is recoverable.
       fs.renameSync(directory, moved);
-      const current = copyReceipt(moved, source);
-      if (!sameFile(before, stat(moved)) || current?.hash !== receipt.hash || current.copiedAt !== receipt.copiedAt ||
-          copyHash(moved, receipt.copiedAt) !== receipt.hash) {
-        throw new Error('Skill changed during cleanup');
-      }
-      fs.rmSync(moved, { recursive: true });
-      fs.rmdirSync(retired);
-      removed.push(name);
+      finishRetirement(retired, { name, before, ...receipt });
     } catch {
-      const moved = retired && path.join(retired, name);
-      if (moved && stat(moved)) {
-        issues.push({ name, message: `Skill cleanup paused. Review the retained skill in ${retired}.` });
-      } else {
-        if (retired) fs.rmdirSync(retired);
-        issues.push({ name, message: 'Skill cleanup paused. Check the copy in Oleafly and retry.' });
-      }
+      issues.push({ name, message: 'Skill cleanup paused. Check the copy in Oleafly and retry.' });
     }
   }
-  return { removed, issues };
+  return { removed: [...removed], issues };
 }
 
 module.exports = { removeSkillCopies };

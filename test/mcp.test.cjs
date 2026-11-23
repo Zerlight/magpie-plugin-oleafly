@@ -1,9 +1,9 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { createDecipheriv } = require('node:crypto');
-const { mkdtempSync, readFileSync, rmSync } = require('node:fs');
-const { tmpdir } = require('node:os');
+const { createDecipheriv, createHash } = require('node:crypto');
+const { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } = require('node:fs');
+const { homedir, tmpdir } = require('node:os');
 const { join } = require('node:path');
 const { test } = require('node:test');
 const { translateMcp } = require('../mcp.cjs');
@@ -16,7 +16,9 @@ const calcPlugin = '@magpie-community/tools-calc';
 const remoteUrl = 'https://research.example/mcp?version=1';
 const http = (url) => ({ type: 'http', url });
 const stdio = { type: 'stdio', command: 'node', args: ['mock-server.js', 'two words'], env: {} };
-const server = (name, transport, rest = {}) => ({ name, transport, agents: ['oleafly'], ...rest });
+const server = (name, transport, rest = {}) => ({
+  name, transport, agents: ['oleafly'], ...(transport === 'stdio' && { command: 'node', args: [...stdio.args] }), ...rest,
+});
 const library = (mcp, owned = mcp.map((entry) => entry.name), mcpHub = false) => ({
   mcp, mcpHub, applied: { oleafly: { mcp: owned } },
 });
@@ -97,6 +99,101 @@ test('withholds direct disabled tools, unknown access settings, and legacy SSE',
   }
 });
 
+test('Router name collisions retain only safe, owned individual assignments', () => {
+  const stage = { magpie: stdio, local: stdio, limited: stdio, missingOwner: stdio, other: stdio, calc: http(pluginUrl) };
+  const entries = [
+    server('local', 'stdio'), server('limited', 'stdio', { disabledTools: ['private'] }),
+    server('missingOwner', 'stdio'), server('other', 'stdio', { agents: ['codex'] }),
+    server('calc', 'http', { plugin: calcPlugin, url: pluginUrl }),
+  ];
+  for (const named of [undefined, server('magpie', 'stdio'), server('magpie', 'stdio', { agents: [] })]) {
+    const assigned = named ? [...entries, named] : entries;
+    const owned = ['local', 'limited', 'other', 'calc'];
+    if (named?.agents.includes('oleafly')) owned.push('magpie');
+    const result = translate(stage, { ...library(assigned, owned, true), pluginsOffered: ['@other/tools-calc'] });
+    assert.deepEqual(result.servers.map(s => s.name), owned.includes('magpie') ? ['local', 'magpie'] : ['local']);
+    assert.deepEqual(result.issues.map(s => s.name), ['magpie', 'limited', 'missingOwner', 'calc']);
+  }
+  const missingHub = translate({ local: stdio }, library([server('local', 'stdio')], ['local'], true));
+  assert.deepEqual(missingHub.servers, []);
+});
+
+test('direct stdio must match the current command, ordered arguments, and complete environment', () => {
+  const assigned = server('local', 'stdio', { env: { FIRST: 'one', SECOND: 'two' } });
+  const current = { ...stdio, env: { SECOND: 'two', FIRST: 'one' } };
+  const stale = 'fixture-stale-value';
+  for (const change of [
+    { command: stale }, { args: [...stdio.args].reverse() }, { args: [...stdio.args, stale] },
+    { env: { ...current.env, FIRST: stale } }, { env: { ...current.env, EXTRA: stale } }, { env: {} },
+  ]) {
+    const result = translate({ local: { ...current, ...change } }, library([assigned]));
+    assert.deepEqual(result.servers, []);
+    assert.equal(result.issues[0].name, 'local');
+    assert.ok(!JSON.stringify(result.issues).includes(stale));
+  }
+  assert.deepEqual(translate({ local: current }, library([assigned])).issues, []);
+  const minimal = { name: 'local', agents: ['oleafly'], transport: 'stdio', command: 'fixture' };
+  assert.deepEqual(translate({ local: { type: 'stdio', command: 'fixture', args: [], env: {} } }, library([minimal])).issues, []);
+  assert.equal(translate({ local: current }, library([{ ...assigned, command: undefined }])).servers.length, 0);
+});
+
+test('matches the Claude writer’s home expansion in stdio commands, arguments and env', () => {
+  const home = homedir();
+  const assigned = server('local', 'stdio', { command: '~/bin/fixture', args: ['~'], env: { DIR: '%UserProfile%/fixture' } });
+  const stage = { type: 'stdio', command: home + '/bin/fixture', args: [home], env: { DIR: home + '/fixture' } };
+  assert.deepEqual(translate({ local: stage }, library([assigned])).issues, []);
+  assert.equal(translate({ local: { ...stage, args: ['/other'] } }, library([assigned])).servers.length, 0);
+});
+
+test('matches a cached npx rewrite only to the selected package bin and its arguments', t => {
+  const directory = mkdtempSync(join(tmpdir(), 'magpie-oleafly-npx-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const spec = '@example/fixture@1.0.0';
+  const hash = createHash('sha256').update(spec).digest('hex').slice(0, 16);
+  const pkg = join(directory, 'mcp-npm', hash, 'node_modules', '@example', 'fixture');
+  mkdirSync(pkg, { recursive: true });
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ bin: { fixture: 'main.cjs', other: 'other.cjs' } }));
+  writeFileSync(join(pkg, 'main.cjs'), '');
+  const current = server('local', 'stdio', { command: 'npx', args: ['-y', spec, 'two words'] });
+  const stage = { ...stdio, args: [join(pkg, 'main.cjs'), 'two words'] };
+  const check = (entry, assigned = current) => translate({ local: entry }, library([assigned]), { directory });
+  assert.deepEqual(check(stage).issues, []);
+  for (const change of [{ command: '/other/node' }, { args: [join(pkg, 'other.cjs'), 'two words'] }, { args: [stage.args[0]] }]) {
+    assert.equal(check({ ...stage, ...change }).servers.length, 0);
+  }
+  assert.equal(check(stage, { ...current, args: ['-y', '@example/fixture@2.0.0', 'two words'] }).servers.length, 0);
+  writeFileSync(join(pkg, 'package.json'), JSON.stringify({ bin: 'fixture' }));
+  const script = join(pkg, 'fixture');
+  const extensionless = { ...stage, args: [script, 'two words'] };
+  writeFileSync(script, '#!/usr/bin/env node\n');
+  assert.equal(check(extensionless).servers.length, 1);
+  writeFileSync(script, '#!/bin/sh\n');
+  assert.equal(check(extensionless).servers.length, 0);
+});
+
+test('direct and relayed headers match the selected account and the relay removes upstream authorization', () => {
+  const assigned = server('remote', 'http', {
+    url: remoteUrl, headers: { Authorization: 'base', 'X-Profile': 'fixture' }, account: 'two',
+    accounts: [{ id: 'two', headers: { authorization: 'selected' } }],
+  });
+  const relay = gatewayUrl + '/mcp/remote';
+  for (const [url, headers, ok] of [
+    [remoteUrl, { Authorization: 'selected', 'x-profile': 'fixture' }, true],
+    [remoteUrl, { Authorization: 'base', 'X-Profile': 'fixture' }, false],
+    [remoteUrl, {}, false], [relay, { 'X-Profile': 'fixture' }, true],
+    [relay, { 'X-Profile': 'fixture', Authorization: 'selected' }, false],
+    [relay, { 'X-Profile': 'old' }, false],
+  ]) {
+    const result = translate({ remote: { ...http(url), headers } }, library([assigned]));
+    assert.equal(result.servers.length, ok ? 1 : 0);
+    assert.ok(!JSON.stringify(result.issues).includes('selected'));
+  }
+  const injected = { Authorization: 'fixture-stale' };
+  assert.equal(translate({ magpie: { ...http(hubUrl), headers: injected } }, library([assigned], ['magpie'], true)).servers.length, 0);
+  const plugin = server('calc', 'http', { plugin: calcPlugin, url: pluginUrl });
+  assert.equal(translate({ calc: { ...http(pluginUrl), headers: injected } }, library([plugin])).servers.length, 0);
+});
+
 test('rejects wrong plugin endpoints, broad tools, injected URL credentials and non-loopback HTTP', () => {
   const plugin = server('calc', 'http', { plugin: calcPlugin, url: pluginUrl });
   for (const url of [pluginUrl.replace('/calc', ''), pluginUrl.replace('/calc', '/other'), pluginUrl.replace('127.0.0.1', 'localhost')]) {
@@ -112,6 +209,32 @@ test('rejects wrong plugin endpoints, broad tools, injected URL credentials and 
     assert.deepEqual(servers, []);
     assert.equal(issues[0].name, 'remote');
     assert.ok(!JSON.stringify(issues).includes(url));
+  }
+});
+
+test('query credentials stay out of diagnostics and native files while a query-free relay remains usable', t => {
+  const secret = 'fixture-query-value';
+  const dataDir = mkdtempSync(join(tmpdir(), 'magpie-oleafly-query-'));
+  t.after(() => rmSync(dataDir, { recursive: true, force: true }));
+  const relay = gatewayUrl + '/mcp/remote';
+  const sync = mcp => reconcile({ dataDir, readDesired: () => ({ mcp }) });
+  const priorUrl = 'https://research.example/mcp?api_key=' + secret;
+  sync([{ name: 'remote', transport: 'remote', url: priorUrl, headers: {} }]);
+  for (const query of ['api_key=', 'version=1&access%5ftoken=', 'custom=', 'version=']) {
+    const url = 'https://research.example/mcp?' + query + secret;
+    const assigned = library([server('remote', 'http', { url })]);
+    const blocked = translate({ remote: http(url) }, assigned);
+    assert.deepEqual(blocked.servers, []);
+    assert.match(blocked.issues[0].message, /query/i);
+    assert.ok(!JSON.stringify(blocked).includes(secret));
+    assert.deepEqual(sync(blocked.servers).conflicts, []);
+    assert.deepEqual(JSON.parse(readFileSync(join(dataDir, 'config.json'))).mcp_servers, []);
+  }
+  const routed = translate({ remote: http(relay) }, library([server('remote', 'http', { url: priorUrl })]));
+  assert.deepEqual(routed, { servers: [{ name: 'remote', transport: 'remote', url: relay, headers: {} }], issues: [] });
+  assert.deepEqual(sync(routed.servers), { changed: true, conflicts: [] });
+  for (const file of ['config.json', '.magpie-oleafly-state.json']) {
+    assert.ok(!readFileSync(join(dataDir, file), 'utf8').includes(secret));
   }
 });
 
@@ -139,9 +262,9 @@ test('reconcile encrypts translated env and headers and ignores unassigned entri
     nil: stdio,
   }, library([
     { name: 'missing', transport: 'stdio' },
-    server('local', 'stdio'),
+    server('local', 'stdio', { env: { TOKEN: secret, EMPTY: '' } }),
     server('nil', 'stdio', { agents: null }),
-    server('remote', 'http', { url: remoteUrl }),
+    server('remote', 'http', { url: remoteUrl, headers: { Authorization: `Bearer ${secret}` } }),
   ]));
   assert.deepEqual(result.servers.map((entry) => entry.name), ['local', 'remote']);
   assert.deepEqual(result.servers[0].env, { TOKEN: secret, EMPTY: '' });
