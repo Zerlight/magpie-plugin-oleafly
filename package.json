@@ -4,7 +4,7 @@
   "description": "Connect Oleafly to models, skills and MCP tools managed in Magpie.",
   "type": "module",
   "main": "./index.mjs",
-  "files": ["assets", "index.mjs", "bridge.cjs", "windows-host.ps1", "oleafly.agent.js", "skills.cjs", "mcp.cjs", "reconcile.cjs", "README.md", "integration/README.md"],
+  "files": ["assets", "index.mjs", "bridge.cjs", "windows-host.ps1", "oleafly.agent.js", "skills.cjs", "mcp.cjs", "reconcile.cjs", "README.md", "README.zh-CN.md", "integration/README.md"],
   "keywords": ["magpie-plugin", "magpie-agent", "oleafly"],
   "magpie": {
     "name": "Oleafly",
