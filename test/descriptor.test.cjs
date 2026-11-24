@@ -37,7 +37,7 @@ test("connect stages the gateway and agent identity beside Magpie's selected mod
 const magpieBin = process.env.MAGPIE_DESCRIPTOR_TEST_BIN
 
 test("Magpie stages model selection and copies assigned skills in an isolated profile", {
-  skip: !magpieBin && "Set MAGPIE_DESCRIPTOR_TEST_BIN to a Magpie 0.1.4705 executable.",
+  skip: !magpieBin && "Set MAGPIE_DESCRIPTOR_TEST_BIN to a reference Magpie executable.",
 }, (t) => {
   const home = mkdtempSync(join(tmpdir(), "magpie-oleafly-descriptor-"))
   t.after(() => rmSync(home, { recursive: true, force: true }))
@@ -58,8 +58,11 @@ test("Magpie stages model selection and copies assigned skills in an isolated pr
     encoding: "utf8",
     timeout: 15000,
     env: {
-      HOME: home,
-      PATH: "/usr/bin:/bin",
+      HOME: home, USERPROFILE: home,
+      ...(process.platform === "win32" ? {
+        PATH: join(process.env.SystemRoot, "System32"), SystemRoot: process.env.SystemRoot,
+        APPDATA: join(home, "roaming"), LOCALAPPDATA: join(home, "local"), TEMP: home, TMP: home,
+      } : { PATH: "/usr/bin:/bin" }),
       XDG_CONFIG_HOME: dirname(config),
       XDG_CACHE_HOME: join(home, "cache"),
       XDG_STATE_HOME: join(home, "state"),
@@ -70,7 +73,7 @@ test("Magpie stages model selection and copies assigned skills in an isolated pr
       OLEAFLY_DATA_DIR: oleafly,
     },
   })
-  assert.match(run("version"), /\b0\.1\.4705\b/)
+  assert.match(run("version"), /\b0\.1\.(?:4705|4723)\b/)
 
   write(join(pkg, "package.json"), JSON.stringify({
     name: "magpie-plugin-oleafly",
@@ -78,14 +81,14 @@ test("Magpie stages model selection and copies assigned skills in an isolated pr
   }))
   copyFileSync(entryPath, join(pkg, "oleafly.agent.js"))
   write(join(oleafly, "config.json"), previousConfig)
+  mkdirSync(join(dirname(desired), "desktop"), { recursive: true })
   run("plugin", "add", pkg)
   assert.match(run("ls"), /\bOleafly\b/)
   assert.equal(readFileSync(join(oleafly, "config.json"), "utf8"), previousConfig)
   assert.equal(existsSync(desired), false)
 
-  mkdirSync(dirname(desired), { mode: 0o700 })
   mkdirSync(skillsDir)
-  symlinkSync(skillsDir, join(dirname(desired), "skills"), "dir")
+  symlinkSync(skillsDir, join(dirname(desired), "skills"), process.platform === "win32" ? "junction" : "dir")
   run("provider", "add", "Fixture", "id=fixture", "url=http://127.0.0.1:1/v1", "key=fixture-key", "models=first,second")
   run("group", "add", "Research", "models=fixture/first,fixture/second")
   run("oleafly", "fixture/first")
