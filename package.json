@@ -1,6 +1,6 @@
 {
   "name": "magpie-plugin-oleafly",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Connect Oleafly to models, skills and MCP tools managed in Magpie.",
   "type": "module",
   "main": "./index.mjs",
