@@ -1,10 +1,12 @@
 import { execFile, spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync,
   realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { once } from 'node:events';
 import net from 'node:net';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { setTimeout as delay } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
@@ -13,8 +15,16 @@ import { models, referenceFile, resultText, serveFixtures, toolMarker } from './
 const exec = promisify(execFile);
 const repo = fileURLToPath(new URL('../', import.meta.url));
 const fixtureScript = fileURLToPath(new URL('./fixtures.mjs', import.meta.url));
-const magpie = realpathSync(process.env.MAGPIE_BIN ?? '/Applications/magpie.app/Contents/MacOS/magpie');
-const oleafly = realpathSync(process.env.OLEAFLY_BIN ?? '/Applications/Oleafly.app/Contents/MacOS/oleafly-cli');
+const linux = process.platform === 'linux';
+const windows = process.platform === 'win32';
+function binary(variable, unixDefault) {
+  const file = process.env[variable] ?? (windows ? undefined : unixDefault);
+  check(file && path.isAbsolute(file), 'Set ' + variable + ' to an absolute executable path.');
+  return realpathSync(file);
+}
+const magpie = binary('MAGPIE_BIN', linux ? '/usr/bin/magpie' : '/Applications/magpie.app/Contents/MacOS/magpie');
+const oleafly = binary('OLEAFLY_BIN', linux ? '/usr/bin/oleafly-cli' : '/Applications/Oleafly.app/Contents/MacOS/oleafly-cli');
+const bun = binary('MAGPIE_BUN');
 const [mode, extra] = process.argv.slice(2);
 if (extra || (mode && !['--preflight', '--gui', '--cli'].includes(mode))) {
   throw new Error('Usage: node integration/acceptance.mjs [--preflight | --gui | --cli]');
@@ -27,22 +37,43 @@ const magpieBase = path.basename(path.dirname(magpie)) === 'MacOS'
 const hasPortableData = ['.portable', 'data'].some(name => existsSync(path.join(magpieBase, name)));
 if (hasPortableData) throw new Error('Magpie has adjacent portable data. Use a copy of the installed binary in an empty directory.');
 
-const root = mkdtempSync('/private/tmp/magpie-oleafly-acceptance-');
+const root = mkdtempSync(path.join(tmpdir(), 'magpie-oleafly-acceptance-'));
 const dir = name => path.join(root, name);
-for (const name of ['home', 'bin', 'tmp', 'project', 'oleafly', 'xdg-config', 'xdg-data', 'xdg-cache', 'xdg-state']) {
-  mkdirSync(dir(name), { mode: 0o700 });
-}
 const env = {
-  HOME: dir('home'), USERPROFILE: dir('home'), SHELL: '/bin/sh',
-  PATH: dir('bin') + ':/usr/bin:/bin:/usr/sbin:/sbin',
+  HOME: dir('home'), USERPROFILE: dir('home'), MAGPIE_BUN: bun,
   TMPDIR: dir('tmp'), XDG_CONFIG_HOME: dir('xdg-config'), XDG_DATA_HOME: dir('xdg-data'),
   XDG_CACHE_HOME: dir('xdg-cache'), XDG_STATE_HOME: dir('xdg-state'),
   OLEAFLY_DATA_DIR: dir('oleafly'), MAGPIE_NO_ACCOUNTS: '1', MAGPIE_NO_STATS: '1',
   NO_PROXY: '127.0.0.1,localhost', no_proxy: '127.0.0.1,localhost',
   NO_COLOR: '1', TERM: 'dumb', LANG: 'en_US.UTF-8',
 };
-if (process.env.MAGPIE_BUN) env.MAGPIE_BUN = realpathSync(process.env.MAGPIE_BUN);
-symlinkSync(oleafly, dir('bin/oleafly'));
+function setupProfile() {
+  for (const name of ['home', 'bin', 'tmp', 'project', 'oleafly', 'xdg-config', 'xdg-data', 'xdg-cache', 'xdg-state']) {
+    mkdirSync(dir(name), { mode: 0o700 });
+  }
+  if (windows) {
+    const systemRoot = process.env.SystemRoot;
+    check(systemRoot && path.isAbsolute(systemRoot), 'Windows SystemRoot is unavailable');
+    const system32 = path.join(systemRoot, 'System32');
+    Object.assign(env, {
+      SystemRoot: systemRoot, WINDIR: systemRoot, ComSpec: path.join(system32, 'cmd.exe'),
+      PATH: [dir('bin'), system32, systemRoot].join(path.delimiter), PATHEXT: '.COM;.EXE;.BAT;.CMD',
+      APPDATA: dir('home/AppData/Roaming'), LOCALAPPDATA: dir('home/AppData/Local'),
+      ProgramFiles: dir('Program Files'), ProgramW6432: dir('Program Files'), 'ProgramFiles(x86)': dir('Program Files (x86)'),
+      TEMP: dir('tmp'), TMP: dir('tmp'),
+    });
+    mkdirSync(env.APPDATA, { recursive: true });
+    mkdirSync(env.LOCALAPPDATA, { recursive: true });
+    const names = env.PATHEXT.split(';').map(ext => 'magpie' + ext);
+    check(!env.PATH.split(';').some(folder => names.some(name => existsSync(path.join(folder, name)))),
+      'Windows child PATH already contains Magpie; the parent executable lookup cannot be tested');
+    copyFileSync(oleafly, dir('bin/oleafly.exe'));
+  } else {
+    env.SHELL = '/bin/sh';
+    env.PATH = dir('bin') + ':/usr/bin:/bin:/usr/sbin:/sbin';
+    if (!linux) symlinkSync(oleafly, dir('bin/oleafly'));
+  }
+}
 const configPath = dir('oleafly/config.json');
 const libraryPath = dir('xdg-config/magpie/library.json');
 const skill = 'acceptance-receipt';
@@ -91,7 +122,8 @@ function diagnostic(output) {
     [/bun.*(download|not ready|can't|no such|failed)/i, 'Bun runtime unavailable'],
     [/relative path|not detected/i, 'agent detection failed'],
     [/connection refused|connect error/i, 'connection refused'],
-    [/permission denied|operation not permitted/i, 'permission denied'],
+    [/permission denied|operation not permitted|access is denied/i, 'permission denied'],
+    [/cannot find the (?:file|path)|os error [23]\b|no such file/i, 'file or directory unavailable'],
     [/no provider|model.*not found|not set.*model/i, 'provider or model unavailable'],
     [/unsupported|unknown flag|unexpected argument/i, 'unsupported command or argument'],
   ]) if (pattern.test(output)) return category;
@@ -99,17 +131,68 @@ function diagnostic(output) {
 }
 async function run(bin, args, childEnv = env) {
   try {
-    const { stdout } = await exec(bin, args, { cwd: dir('project'), env: childEnv, timeout: 25000, maxBuffer: 2 << 20 });
+    const { stdout } = await exec(bin, args, { cwd: dir('project'), env: childEnv, windowsHide: true,
+      timeout: windows ? 60000 : 25000, maxBuffer: 2 << 20 });
     return stdout;
   } catch (error) {
+    if (bin === magpie && args.length === 1 && args[0] === 'ls' && error.code === 1 &&
+        /magpie: no supported agents found on this machine/.test(error.stderr)) return '';
     throw new Error(path.basename(bin) + ' ' + args.slice(0, 2).join(' ') +
       ' failed (' + (error.code ?? error.signal ?? 'no status') + ', ' +
       diagnostic(error.stdout + '\n' + error.stderr) + ')');
   }
 }
 const mg = (...args) => run(magpie, args);
+
+async function checkDiscovery(nativeCli) {
+  const source = nativeCli ? 'native CLI' : 'desktop';
+  const home = dir(nativeCli ? 'cli-only' : 'desktop-only');
+  const bin = path.join(home, 'bin');
+  const profile = path.join(home, 'profile');
+  const share = path.join(home, 'share');
+  const applications = path.join(share, 'applications');
+  const cold = { ...env, HOME: home, USERPROFILE: home, PATH: bin, OLEAFLY_DATA_DIR: profile,
+    XDG_DATA_HOME: share, XDG_DATA_DIRS: path.join(home, 'system-share'), XDG_CONFIG_HOME: path.join(home, 'config'),
+    XDG_CACHE_HOME: path.join(home, 'cache'), XDG_STATE_HOME: path.join(home, 'state') };
+  mkdirSync(bin, { recursive: true });
+  if (windows) {
+    cold.PATH = [bin, path.join(env.SystemRoot, 'System32'), env.SystemRoot].join(path.delimiter);
+    cold.ProgramFiles = cold.ProgramW6432 = path.join(home, 'Program Files');
+    cold.APPDATA = path.join(home, 'AppData/Roaming');
+    cold.LOCALAPPDATA = path.join(home, 'AppData/Local');
+    mkdirSync(cold.APPDATA, { recursive: true });
+    mkdirSync(cold.LOCALAPPDATA, { recursive: true });
+    check(!cold.PATH.split(';').some(folder => existsSync(path.join(folder, 'oleafly.exe'))),
+      'desktop discovery requires oleafly.exe to be absent from the child PATH');
+  }
+  if (nativeCli) {
+    copyFileSync(oleafly, path.join(bin, windows ? 'oleafly-cli.exe' : 'oleafly-cli'));
+  } else if (windows) {
+    const install = path.join(cold.ProgramFiles, 'Oleafly');
+    mkdirSync(install, { recursive: true });
+    const desktop = path.join(path.dirname(oleafly), 'oleafly.exe');
+    copyFileSync(desktop, path.join(install, 'oleafly.exe'));
+  } else {
+    mkdirSync(applications, { recursive: true });
+    // Only the launcher can resolve this executable; Magpie looks for a CLI named oleafly.
+    symlinkSync(oleafly, path.join(bin, 'oleafly-desktop'));
+    writeFileSync(path.join(applications, 'Oleafly.desktop'), '[Desktop Entry]\nType=Application\nName=Oleafly\nExec=oleafly-desktop %F\n');
+  }
+  await run(magpie, ['plugin', 'add', packageDir], cold);
+  const rows = async () => (await run(magpie, ['ls'], cold)).split('\n').filter(line => /^\s+Oleafly\b/i.test(line));
+  const marker = path.join(home, '.magpie-oleafly/desktop');
+  try {
+    await eventually(async () => (await rows()).length === 1 && existsSync(marker),
+      source + ' discovery did not register one Oleafly agent with the detection marker');
+    check(!existsSync(path.join(profile, 'config.json')) && !existsSync(path.join(home, '.magpie-oleafly/agent.json')),
+      source + ' discovery configured a model before selection');
+  } finally {
+    await run(magpie, ['plugin', 'rm', packageDir], cold);
+  }
+  pass(source + ' discovery registered one agent without the oleafly alias or an existing configuration');
+}
 async function eventually(predicate, message) {
-  const deadline = Date.now() + 7500;
+  const deadline = Date.now() + (windows ? 20000 : 7500);
   do {
     if (await predicate()) return;
     await delay(100);
@@ -126,7 +209,7 @@ async function port() {
 let webAddress;
 async function startHost() {
   const child = spawn(magpie, ['serve', ...(webAddress ? ['--web=' + webAddress] : [])], {
-    cwd: dir('project'), env, stdio: ['ignore', 'ignore', 'pipe'], detached: true,
+    cwd: dir('project'), env, stdio: ['ignore', 'ignore', 'pipe'], detached: !windows, windowsHide: true,
   });
   const resident = { child, diagnostics: '', done: new Promise(resolve => {
     child.once('exit', resolve);
@@ -144,12 +227,20 @@ async function startHost() {
 async function stopHost() {
   if (!host) return;
   const { child, done } = host;
-  child.kill('SIGTERM');
-  const timer = setTimeout(() => child.kill('SIGKILL'), 4500);
-  await done;
-  clearTimeout(timer);
-  if (child.pid) {
-    try { process.kill(-child.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+  if (windows) {
+    // taskkill needs the living parent PID to find the Bun host and its stdio servers.
+    if (child.pid && child.exitCode === null && child.signalCode === null) {
+      await run(path.join(env.SystemRoot, 'System32/taskkill.exe'), ['/pid', String(child.pid), '/T', '/F']);
+    }
+    await done;
+  } else {
+    child.kill('SIGTERM');
+    const timer = setTimeout(() => child.kill('SIGKILL'), 4500);
+    await done;
+    clearTimeout(timer);
+    if (child.pid) {
+      try { process.kill(-child.pid, 'SIGTERM'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
+    }
   }
   host = undefined;
 }
@@ -204,23 +295,41 @@ async function resetModel(original) {
     'Agent default did not restore the original selection');
 }
 async function withConfigLock(action) {
-  const lock = spawn('/usr/bin/lockf', ['-k', dir('oleafly/.config-store.lock'),
-    '/bin/sh', '-c', 'echo locked; read -r release'], { cwd: dir('project'), env, stdio: ['pipe', 'pipe', 'ignore'] });
+  const options = { cwd: env.OLEAFLY_DATA_DIR, env, windowsHide: true, stdio: ['pipe', 'pipe', 'ignore'] };
+  const lock = windows
+    ? spawn(path.join(env.SystemRoot, 'System32/WindowsPowerShell/v1.0/powershell.exe'), [
+      '-NoLogo', '-NoProfile', '-NonInteractive', '-Command', `
+        $ErrorActionPreference = 'Stop'
+        $file = [IO.File]::Open((Join-Path $env:OLEAFLY_DATA_DIR '.config-store.lock'), 'OpenOrCreate', 'ReadWrite', 'ReadWrite, Delete')
+        try {
+          $file.Lock(0, 1)
+          [Console]::WriteLine('locked')
+          [void][Console]::ReadLine()
+          $file.Unlock(0, 1)
+        } finally { $file.Dispose() }`], options)
+    : spawn(linux ? '/usr/bin/flock' : '/usr/bin/lockf', [linux ? '-x' : '-k', '.config-store.lock',
+      '/bin/sh', '-c', 'echo locked; read -r release'], options);
   const closed = once(lock, 'close');
+  const lines = createInterface({ input: lock.stdout });
   try {
-    const ready = await Promise.race([once(lock.stdout, 'data'), closed, delay(2000)]);
-    check(ready?.[0]?.toString().trim() === 'locked', 'fixture failed to hold Oleafly’s config lock');
+    const ready = await Promise.race([once(lines, 'line'), closed, delay(windows ? 10000 : 2000, undefined, { ref: false })]);
+    check(ready?.[0] === 'locked', 'external lock holder failed to acquire .config-store.lock');
     await action();
+    check(lock.exitCode === null && lock.signalCode === null, 'external lock holder exited during contention');
   } finally {
     lock.stdin.end();
+    const timer = setTimeout(() => lock.kill('SIGKILL'), 3000);
     await closed;
+    clearTimeout(timer);
   }
 }
 async function interruptBeforeWrite(from, to) {
   await withConfigLock(async () => {
     const before = readFileSync(configPath);
+    host.diagnostics = '';
     await mg('oleafly', to);
-    await delay(750);
+    await eventually(() => /\.config-store\.lock is busy/i.test(host.diagnostics),
+      'resident bridge did not report contention with the external config lock');
     check(readFileSync(configPath).equals(before) && config().ai_model === from,
       'reconciliation modified config while the Oleafly lock was held');
     await stopHost();
@@ -237,23 +346,32 @@ async function conversation(expected, options = [], plan = []) {
   const start = fixture.upstream.length;
   fixture.plan(plan);
   try {
-    const reply = await run(oleafly, ['agent', 'run', '--json', '--no-input', '--timeout', '15',
+    const reply = await run(oleafly, ['agent', 'run', '--project', dir('project'), '--json', '--no-input', '--timeout', windows ? '45' : '15',
       '--max-steps', '8', ...options, 'Run the acceptance fixture and return its marker.']);
     check(reply.includes(resultText), 'fresh Oleafly CLI did not return the fixture reply');
     const calls = fixture.upstream.slice(start);
     check(calls.length > 0 && calls.every(call => call.model === expected), 'upstream received the wrong model');
     for (const item of plan) {
-      check(calls.some(call => call.receipts.includes(item.marker)), 'CLI did not receive the result from ' + item.name);
+      check(item.force || calls.some(call => call.tools.some(name => name.includes(item.name))),
+        'native CLI did not advertise ' + item.name);
+      check(calls.some(call => call.receipts.includes(item.marker)), 'native CLI did not return the expected tool result from ' + item.name);
     }
     return calls[0].tools;
   } finally {
     fixture.plan([]);
   }
 }
+const skillBody = 'Read the receipt labeled fixture-skill-body.';
+function readSkill(expectedModel, referenceMarker, options) {
+  return conversation(expectedModel, [...options, '--skill', skill], [
+    { name: 'load_skill', args: { id: skill }, marker: skillBody },
+    { name: 'read_skill_file', args: { id: skill, path: referenceFile }, marker: referenceMarker },
+  ]);
+}
 function writeSkill(where, marker) {
   mkdirSync(path.join(where, 'references'), { recursive: true });
   mkdirSync(path.join(where, 'assets'), { recursive: true });
-  writeFileSync(path.join(where, 'SKILL.md'), '---\nname: ' + skill + '\ndescription: Read the acceptance receipt.\n---\n\nRead the receipt.\n');
+  writeFileSync(path.join(where, 'SKILL.md'), '---\nname: ' + skill + '\ndescription: Read the acceptance receipt.\n---\n\n' + skillBody + '\n');
   writeFileSync(path.join(where, referenceFile), marker + '\n');
   writeFileSync(path.join(where, 'assets/receipt.bin'), asset);
 }
@@ -307,23 +425,48 @@ async function detached(original, action) {
   const staged = dir('home/.magpie-oleafly/mcp.json');
   await eventually(() => existsSync(staged) && readFileSync(staged, 'utf8').includes('fixture-staging-header'),
     'credential fixture was missing before plugin ' + action);
-  await withConfigLock(async () => {
-    await pluginAction(action);
-    await delay(2200);
-    check(config().ai_provider !== original.ai_provider, 'cleanup changed the native config under its lock');
-  });
+  const note = dir('oleafly/.magpie-oleafly-cleanup.txt');
+  if (windows && action === 'rm') {
+    let locked;
+    const ready = new Promise(resolve => { locked = resolve; });
+    await Promise.all([
+      withConfigLock(async () => {
+        locked();
+        await eventually(() => existsSync(note), 'uninstall did not record contention with the native lock');
+        check(config().ai_provider !== original.ai_provider, 'uninstall changed the native config under its lock');
+      }),
+      ready.then(() => pluginAction(action)),
+    ]);
+  } else {
+    await withConfigLock(async () => {
+      await pluginAction(action);
+      await delay(2200);
+      check(config().ai_provider !== original.ai_provider, 'cleanup changed the native config under its lock');
+    });
+    if (windows) {
+      check(existsSync(note) && /enable.*disable/i.test(readFileSync(note, 'utf8')),
+        'a lock outliving the Windows host did not leave recovery instructions');
+      await pluginAction('on');
+      await refreshHost();
+      await eventually(() => existsSync(dir('home/.magpie-oleafly/desktop')), 'the plugin did not reactivate for cleanup');
+      await pluginAction('off');
+      pass('Windows retained the locked config and allowed the pending disable to be retried');
+    }
+  }
   await refreshHost();
   await eventually(() => config().ai_provider === original.ai_provider && config().ai_model === original.ai_model &&
     config().ai_custom_providers.length === original.ai_custom_providers.length &&
     !mcp('remoteprobe') && !mcp('magpie') && !mcp('stdioprobe') && !mcp(pluginFixtureName),
   'plugin ' + action + ' failed to clean up in the resident host');
   check((await mg('ls')).split('\n').every(line => !/^\s+Oleafly\b/i.test(line)), 'detected row survived plugin ' + action);
+  check(!existsSync(dir('home/.magpie-oleafly/desktop')), 'desktop detection directory survived plugin ' + action);
   check(mcp('unrelated').args.includes('editedprobe'), 'later unrelated MCP edit was replaced');
   check(Boolean(library().mcpHub), 'plugin ' + action + ' changed the global MCP Router setting');
   await conversation(models[1], ['--no-mcp']);
   await eventually(() => !existsSync(skillDestination), 'plugin ' + action + ' left an owned skill copy');
   check(!existsSync(staged) || !readFileSync(staged, 'utf8').includes('fixture-staging-header'),
     'plugin ' + action + ' retained an assigned credential in staging');
+  if (windows) check(!existsSync(note), 'completed Windows cleanup left a pending recovery notice');
 }
 async function pluginAction(action) {
   if (!webAddress) return mg('plugin', action, packageDir);
@@ -396,17 +539,30 @@ async function exerciseWeb(original) {
 }
 
 try {
+  setupProfile();
   fixture = await serveFixtures();
   env.MAGPIE_ADDR = '127.0.0.1:' + await port();
   // Built-in catalog/update checks may try public URLs. Keep those requests on loopback.
   env.HTTP_PROXY = env.HTTPS_PROXY = env.ALL_PROXY = fixture.base;
   env.http_proxy = env.https_proxy = env.all_proxy = fixture.base;
   stage = 'binary versions and baseline';
-  check(/^magpie 0\.1\.4705\b/.test(await mg('version')), 'expected Magpie 0.1.4705');
+  const version = (await mg('version')).trim();
+  check(/^magpie 0\.1\.(4705|4723)$/.test(version), 'expected Magpie 0.1.4705 or 0.1.4723');
   check(/^oleafly 0\.4\.13\b/.test(await run(oleafly, ['--version'])), 'expected Oleafly 0.4.13');
+  check((await run(bun, ['--version'])).trim() === '1.4.2', 'expected Bun 1.4.2');
+  pass(version + ', Oleafly 0.4.13, Bun 1.4.2 on ' + process.platform + '/' + process.arch);
+  if ((linux || windows) && mode !== '--preflight') {
+    stage = 'desktop-only discovery';
+    await scenario(stage, () => checkDiscovery(false));
+    stage = 'native CLI discovery';
+    await scenario(stage, () => checkDiscovery(true));
+  }
+  stage = 'fixture model setup';
   await mg('update', 'auto', 'off');
   writeFileSync(dir('project/main.md'), '# Acceptance fixture\n');
-  const stdio = name => ({ name, enabled: true, transport: 'stdio', command: process.execPath, args: [fixtureScript, 'stdio', name], env: {} });
+  const stdioScript = dir('bin/fixtures.mjs');
+  copyFileSync(fixtureScript, stdioScript);
+  const stdio = name => ({ name, enabled: true, transport: 'stdio', command: bun, args: [stdioScript, 'stdio', name], env: {} });
   const original = {
     ai_provider: 'local-original', ai_model: models[1],
     ai_custom_providers: [{ id: 'local-original', name: 'Original fixture', baseURL: fixture.base + '/v1', keyOptional: true, reasoningEffort: false }],
@@ -430,19 +586,25 @@ try {
   await probeGateway();
   await conversation(models[1], ['--no-mcp']);
   pass('installed binary versions, resident gateway routed a fixture request, and original Oleafly CLI model worked');
+  writeSkill(skillDestination, 'user-skill-receipt');
+  if (mode === '--preflight') {
+    await scenario('native skill and reference', async () => {
+      await readSkill(models[1], 'user-skill-receipt', ['--no-mcp']);
+      pass('native Oleafly CLI loaded the skill body and read its reference');
+    });
+  }
   stage = 'native MCP and Library fixture setup';
   writePluginTool();
   await mg('plugin', 'add', pluginFixture);
   await refreshHost();
-  await mg('library', 'mcp', 'add', 'stdioprobe', process.execPath, fixtureScript, 'stdio', 'stdioprobe', 'agents=none');
+  await mg('library', 'mcp', 'add', 'stdioprobe', bun, stdioScript, 'stdio', 'stdioprobe', 'agents=none');
   await mg('library', 'mcp', 'add', 'remoteprobe', fixture.base + '/mcp', 'agents=none');
   await mg('library', 'mcp', 'router', 'remoteprobe', 'direct');
-  await mg('library', 'mcp', 'add', blockedTool, process.execPath, fixtureScript, 'stdio', blockedTool, 'agents=none');
+  await mg('library', 'mcp', 'add', blockedTool, bun, stdioScript, 'stdio', blockedTool, 'agents=none');
   await eventually(() => library().mcp?.some(entry => entry.name === pluginFixtureName), 'Library did not register the plugin-provided tool server');
   writeSkill(dir('home/.agents/skills/' + skill), 'library-skill-v1');
   await mg('library', 'skill', 'hand-over', skill);
   await mg('library', 'skill', 'agents', skill, 'none');
-  writeSkill(skillDestination, 'user-skill-receipt');
   pass('Magpie loaded the fixture tool plugin and registered the local Library items');
   if (mode === '--preflight') {
     const pluginURL = library().mcp.find(entry => entry.name === pluginFixtureName).url;
@@ -451,9 +613,12 @@ try {
       { name: 'remoteprobe', transport: 'remote', url: fixture.base + '/mcp' },
       { name: pluginFixtureName, transport: 'remote', url: pluginURL },
     ] });
-    await conversation(models[1], mcpPermissions,
-      tools.map(name => ({ name, marker: toolMarker(name) })));
-    pass('native Oleafly CLI executed the stdio, HTTP and Magpie plugin tool fixtures');
+    for (const name of tools) {
+      await scenario('native MCP ' + name, async () => {
+        await conversation(models[1], mcpPermissions, [{ name, marker: toolMarker(name) }]);
+        pass('native Oleafly CLI executed ' + name);
+      });
+    }
   }
   if (mode !== '--preflight') {
     stage = 'local package installation and detection';
@@ -504,10 +669,6 @@ try {
 
       stage = 'Library MCP assignment and Router modes';
       for (const name of ['stdioprobe', 'remoteprobe', pluginFixtureName]) await mg('library', 'mcp', 'agents', name, 'oleafly');
-      await mcpMatrix(false);
-      pass('Router off executed assigned stdio, HTTP and plugin tools and rejected an unassigned call');
-      await mcpMatrix(true);
-      pass('Router on executed scoped hub tools, retained the direct HTTP entry and rejected an unassigned call');
 
       await scenario('skill copy and collision', async () => {
         const collision = await mg('library', 'skill', 'agents', skill, 'oleafly');
@@ -525,10 +686,18 @@ try {
         writeFileSync(path.join(librarySkill, referenceFile), 'library-skill-v2\n');
         await mg('library', 'sync');
         check(copyIs('library-skill-v2'), 'Library sync did not refresh the changed reference');
-        await conversation(models[0], ['--no-mcp', '--skill', skill], [
-          { name: 'load_skill', args: { id: skill }, marker: skill },
-          { name: 'read_skill_file', args: { id: skill, path: referenceFile }, marker: 'library-skill-v2' },
-        ]);
+        pass('Library preserved the collision and refreshed the real skill directory and reference');
+      });
+      for (const routed of [false, true]) {
+        const label = 'MCP Router ' + (routed ? 'on' : 'off');
+        await scenario(label, async () => {
+          await mcpMatrix(routed);
+          pass(label + ' executed assigned stdio, HTTP and plugin tools and rejected an unassigned call');
+          await readSkill(models[0], 'library-skill-v2', mcpPermissions);
+          pass(label + ' loaded the Library skill body and read the updated reference');
+        });
+      }
+      await scenario('skill removal and backup', async () => {
         await mg('library', 'skill', 'agents', skill, 'none');
         check(!existsSync(skillDestination) || copyIs('user-skill-receipt'), 'removing the assignment left a managed skill');
         const backups = dir('xdg-config/magpie/backups');
@@ -536,7 +705,7 @@ try {
           const saved = path.join(backups, stamp, 'oleafly', 'skills', skill, referenceFile);
           return existsSync(saved) && readFileSync(saved, 'utf8').trim() === 'user-skill-receipt';
         })), 'Magpie did not preserve the replaced user skill');
-        pass('Library collision handling, real skill copy, and updated reference read by Oleafly CLI');
+        pass('removing the managed skill preserved the displaced user skill');
       });
 
       await scenario('interrupted configuration sync', async () => {
@@ -606,8 +775,9 @@ try {
 } catch (error) {
   fail(stage, error);
 } finally {
-  await stopHost();
-  fixture?.close();
-  rmSync(root, { force: true, recursive: true });
+  try { await stopHost(); } finally {
+    fixture?.close();
+    rmSync(root, { force: true, recursive: true, maxRetries: 8, retryDelay: 200 });
+  }
 }
 if (failures) process.exitCode = 1;
