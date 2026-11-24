@@ -1,14 +1,16 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { spawnSync } = require('node:child_process');
-const { createCipheriv, createDecipheriv } = require('node:crypto');
+const { spawn, spawnSync } = require('node:child_process');
+const { createCipheriv, createDecipheriv, createHash } = require('node:crypto');
+const { once } = require('node:events');
 const fs = require('node:fs');
 const { tmpdir } = require('node:os');
 const { join } = require('node:path');
 const test = require('node:test');
-const { reconcile } = require('../reconcile.cjs');
+const { reconcile, deferRemoval, retryPendingRemoval, cancelPendingRemoval } = require('../reconcile.cjs');
 
+const windows = process.platform === 'win32';
 const providerId = 'magpie-oleafly';
 const stateFile = '.magpie-oleafly-state.json';
 const model = { id: 'fixture/first', baseURL: 'http://127.0.0.1:49876/v1', apiKey: 'magpie-oleafly-fixture-token' };
@@ -162,7 +164,7 @@ test('stores MCP headers and env in Oleafly envelopes and survives Oleafly reiss
   for (const name of ['config.json', stateFile, 'mcp-server-secrets.json']) {
     const bytes = fs.readFileSync(f.path(name), 'utf8');
     assert.doesNotMatch(bytes, /upstream-fixture-secret|stdio-secret|unrelated-secret/);
-    assert.equal(fs.statSync(f.path(name)).mode & 0o777, 0o600);
+    if (!windows) assert.equal(fs.statSync(f.path(name)).mode & 0o777, 0o600);
   }
 
   const rotated = `__stored__:v1:${'a'.repeat(64)}`;
@@ -362,17 +364,29 @@ function interrupted(f, options, when) {
   const run = spawnSync(process.execPath, ['-e', `
     const fs = require('node:fs');
     const { basename } = require('node:path');
-    const { reconcile } = require(process.argv[1]);
-    const rename = fs.renameSync;
-    fs.renameSync = (from, to) => {
-      const config = basename(to) === 'config.json';
-      if (config && process.argv[3] === 'before') process.kill(process.pid, 'SIGKILL');
-      rename(from, to);
-      if (config && process.argv[3] === 'after') process.kill(process.pid, 'SIGKILL');
+    const stop = () => process.platform === 'win32' ? process.exit(86) : process.kill(process.pid, 'SIGKILL');
+    const interrupt = move => (from, to, ...args) => {
+      const name = Buffer.isBuffer(to) ? to.toString('utf16le', 0, to.length - 2) : to;
+      const config = basename(name) === 'config.json';
+      if (config && process.argv[3] === 'before') stop();
+      const result = move(from, to, ...args);
+      if (config && result !== 0 && process.argv[3] === 'after') stop();
+      return result;
     };
+    if (process.platform === 'win32') {
+      const ffi = require('bun:ffi');
+      const dlopen = ffi.dlopen;
+      ffi.dlopen = (...args) => {
+        const lib = dlopen(...args);
+        if (!lib.symbols.MoveFileExW) return lib;
+        return { symbols: { ...lib.symbols, MoveFileExW: interrupt(lib.symbols.MoveFileExW) } };
+      };
+    } else fs.renameSync = interrupt(fs.renameSync);
+    const { reconcile } = require(process.argv[1]);
     reconcile(JSON.parse(process.argv[2]));
   `, require.resolve('../reconcile.cjs'), JSON.stringify({ dataDir: f.dataDir, ...options }), when], { encoding: 'utf8' });
-  assert.equal(run.signal, 'SIGKILL', run.stderr);
+  if (windows) assert.equal(run.status, 86, run.stderr);
+  else assert.equal(run.signal, 'SIGKILL', run.stderr);
 }
 
 test('a process killed before config replacement leaves the old config valid and retries cleanly', t => {
@@ -437,4 +451,218 @@ test('invalid config, secret envelopes, desired state, and callback failures hav
   f.write({ ...f.read('ai-secrets.json'), version: 2 }, 'ai-secrets.json');
   assert.throws(() => f.apply({ model }), error => /Cannot decrypt Oleafly ai-secrets.json/.test(error.message) && !error.message.includes(secret));
   assert.deepEqual(f.read(), original);
+});
+
+test('removal can finish after the plugin exits under contention and its package is removed', async t => {
+  const f = fixture(t);
+  f.apply({ model, mcp: [mcp] });
+  f.write({ plugins: [] }, 'plugins.json');
+  const pkg = f.path('临时 package');
+  fs.mkdirSync(pkg);
+  const source = join(pkg, 'reconcile.cjs');
+  fs.copyFileSync(require.resolve('../reconcile.cjs'), source);
+  const note = '.magpie-oleafly-cleanup.txt';
+  let child;
+  f.apply({ readDesired() {
+    child = spawnSync(process.execPath, ['-e', `
+      const [source, root] = process.argv.slice(1);
+      const fs = require('node:fs');
+      const { deferRemoval } = require(source);
+      const fd = fs.openSync(source, 'r');
+      try { process.stdout.write(deferRemoval(root, root, ['magpie-plugin-oleafly'], fd)); }
+      finally { fs.closeSync(fd); }
+    `, source, f.dataDir], { encoding: 'utf8', timeout: 5000 });
+    fs.rmSync(pkg, { recursive: true });
+    return {};
+  } });
+  assert.equal(child.status, 0, child.error?.message ?? child.stderr);
+  if (windows) {
+    assert.match(child.stdout, /pending/);
+    const receipt = fs.readFileSync(f.path(note), 'utf8');
+    assert.match(receipt, /reinstall it if removed/);
+    assert.doesNotMatch(receipt, /upstream-fixture-secret/);
+    assert.equal(f.read().ai_model, model.id);
+    assert.equal(retryPendingRemoval(f.dataDir, f.dataDir, ['magpie-plugin-oleafly']), '');
+  }
+  const deadline = Date.now() + 5000;
+  while (f.exists(note) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(f.exists(note), false, f.exists(note) && fs.readFileSync(f.path(note), 'utf8'));
+  assert.equal(f.exists(stateFile), false);
+  assert.deepEqual(f.read(), original);
+  assert.deepEqual(secrets(f, 'ai-secrets.json'), {});
+  assert.deepEqual(secrets(f, 'mcp-server-secrets.json'), {});
+});
+
+test('Windows finishes removal inside the retiring host when the native lock clears during its retry', { skip: !windows }, async t => {
+  const f = fixture(t);
+  f.apply({ model });
+  f.write({ plugins: [] }, 'plugins.json');
+  const child = spawn(process.execPath, ['-e', `
+    const fs = require('node:fs');
+    const { join } = require('node:path');
+    const [modulePath, root] = process.argv.slice(1);
+    require(modulePath).reconcile({ dataDir: root, readDesired() {
+      fs.writeSync(1, 'locked');
+      const deadline = Date.now() + 4000;
+      while (!fs.existsSync(join(root, '.magpie-oleafly-cleanup.txt'))) {
+        if (Date.now() >= deadline) process.exit(2);
+        Bun.sleepSync(10);
+      }
+      Bun.sleepSync(100);
+      return {};
+    } });
+  `, require.resolve('../reconcile.cjs'), f.dataDir], { stdio: ['ignore', 'pipe', 'inherit'] });
+  t.after(() => child.kill());
+  const exited = once(child, 'exit');
+  const [ready] = await Promise.race([once(child.stdout, 'data'), exited]);
+  assert.equal(ready?.toString(), 'locked');
+  assert.equal(deferRemoval(f.dataDir, f.dataDir, ['fixture']), '');
+  assert.equal((await exited)[0], 0);
+  assert.equal(f.exists('.magpie-oleafly-cleanup.txt'), false);
+  assert.deepEqual(f.read(), original);
+});
+
+test('durable retry verifies profile, install specs, re-enablement and live ownership', t => {
+  const f = fixture(t);
+  f.apply({ model, mcp: [mcp] });
+  const active = f.read();
+  const spec = 'original-install';
+  const alias = 'second-original-install';
+  const note = '.magpie-oleafly-cleanup.txt';
+  const hash = value => createHash('sha256').update(value).digest('hex');
+  const receipt = ['a'.repeat(32), 'Cleanup pending.', [f.dataDir, spec, alias].map(hash).join(' '), ''].join('\n');
+  const pending = () => fs.writeFileSync(f.path(note), receipt);
+  pending();
+  f.write({ plugins: [] }, 'plugins.json');
+  assert.equal(retryPendingRemoval(f.dataDir, f.path('other profile'), [spec]), '');
+  assert.equal(retryPendingRemoval(f.dataDir, f.dataDir, ['other install']), '');
+  cancelPendingRemoval(f.dataDir);
+  assert.equal(fs.readFileSync(f.path(note), 'utf8'), receipt);
+  if (windows) {
+    assert.match(deferRemoval(f.dataDir, f.path('other profile'), [spec]), /another Magpie profile or installation/i);
+    assert.equal(fs.readFileSync(f.path(note), 'utf8'), receipt);
+  }
+  f.write({ plugins: [{ spec, off: true }, { spec: alias }] }, 'plugins.json');
+  assert.equal(retryPendingRemoval(f.dataDir, f.dataDir, [spec]), '');
+  assert.equal(f.exists(note), false);
+  assert.deepEqual(f.read(), active);
+
+  pending();
+  f.write({ plugins: [{ spec, off: 'yes' }] }, 'plugins.json');
+  assert.match(retryPendingRemoval(f.dataDir, f.dataDir, [spec]), /plugin list/);
+  assert.equal(fs.readFileSync(f.path(note), 'utf8'), receipt);
+  assert.deepEqual(f.read(), active);
+  f.write({ plugins: [{ spec, off: true }] }, 'plugins.json');
+  f.write({ ...active, ai_provider: 'openai', ai_model: 'later-model' });
+  assert.match(retryPendingRemoval(f.dataDir, f.dataDir, [spec]), /chat model changed outside Magpie/);
+  assert.equal(f.read().ai_model, 'later-model');
+  assert.deepEqual(f.read().mcp_servers, original.mcp_servers);
+  assert.deepEqual(secrets(f, 'ai-secrets.json'), {});
+  assert.match(fs.readFileSync(f.path(note), 'utf8'), /chat model changed outside Magpie/);
+  assert.equal(retryPendingRemoval(f.dataDir, f.dataDir, [spec]), '');
+  fs.unlinkSync(f.path(note));
+  fs.mkdirSync(f.path(note));
+  assert.match(retryPendingRemoval(f.dataDir, f.dataDir, [spec]), /magpie-oleafly-cleanup.txt/);
+});
+
+test('file symlinks cannot supply a config, secret key, envelope, ownership record or lock', t => {
+  const f = fixture(t, null);
+  const real = f.path('other');
+  fs.writeFileSync(real, '{}');
+  for (const name of ['config.json', 'ai-secrets.key', 'ai-secrets.json', 'mcp-server-secrets.json',
+    stateFile, '.config-store.lock', '.secret-store.lock']) {
+    fs.rmSync(f.path(name), { force: true });
+    try { fs.symlinkSync(real, f.path(name), 'file'); } catch (error) {
+      if (windows && error.code === 'EPERM') return t.skip('Creating a file symlink requires Windows Developer Mode or privilege.');
+      throw error;
+    }
+    assert.throws(() => f.apply({ model }), error => error.code === 'OLEAFLY_CONFIG' && error.message.includes(name));
+    assert.equal(fs.readFileSync(real, 'utf8'), '{}');
+    assert.ok(fs.lstatSync(f.path(name)).isSymbolicLink());
+    fs.unlinkSync(f.path(name));
+  }
+});
+
+test('Windows refuses a directory junction at a transaction file without symlink privileges', { skip: !windows }, t => {
+  const f = fixture(t);
+  const target = f.path('local folder');
+  fs.mkdirSync(target);
+  fs.symlinkSync(target, f.path('.secret-store.lock'), 'junction');
+  assert.throws(() => f.apply({ model }), error => error.code === 'OLEAFLY_CONFIG' && error.message.includes('.secret-store.lock'));
+  assert.deepEqual(fs.readdirSync(target), []);
+  assert.deepEqual(f.read(), original);
+});
+
+test('Windows byte-range contention and a denied atomic replacement recover without losing old bytes', { skip: !windows }, t => {
+  const f = fixture(t);
+  const lib = require('bun:ffi').dlopen('kernel32.dll', {
+    CreateFileW: { args: ['ptr', 'u32', 'u32', 'ptr', 'u32', 'u32', 'ptr'], returns: 'isize' },
+    LockFileEx: { args: ['isize', 'u32', 'u32', 'u32', 'u32', 'ptr'], returns: 'i32' },
+    CloseHandle: { args: ['isize'], returns: 'i32' },
+  });
+  const { CreateFileW, LockFileEx, CloseHandle } = lib.symbols;
+  t.after(() => lib.close());
+  const originalBytes = fs.readFileSync(f.path('config.json'));
+  for (const name of ['.config-store.lock', '.secret-store.lock', 'config.json']) {
+    const handle = CreateFileW(Buffer.from(f.path(name) + '\0', 'utf16le'), 0x80000000, 3, null, 4, 0x80, null);
+    assert.notEqual(handle, -1n);
+    try {
+      if (name.endsWith('.lock')) {
+        const overlap = Buffer.alloc(32);
+        overlap.writeUInt32LE(1, 20); // Lock a single byte 4 GiB into the fs4 range.
+        assert.ok(LockFileEx(handle, 3, 0, 1, 0, overlap));
+        assert.throws(() => f.apply({ model }), { code: 'OLEAFLY_BUSY' });
+        assert.equal(f.exists(stateFile), false);
+        assert.equal(f.exists('ai-secrets.key'), false);
+      } else {
+        // This read handle allows reconciliation to stage everything, then denies delete sharing at commit.
+        assert.throws(() => f.apply({ model }), /Cannot save Oleafly config.json/);
+        assert.ok(f.read(stateFile).pending);
+        assert.equal(fs.readdirSync(f.dataDir).some(item => item.endsWith('.tmp')), false);
+      }
+      assert.deepEqual(fs.readFileSync(f.path('config.json')), originalBytes);
+    } finally { CloseHandle(handle); }
+  }
+  assert.equal(f.apply({ model }).changed, true);
+  assert.deepEqual(f.apply({ model: null }), { changed: true, conflicts: [] });
+  assert.deepEqual(f.read(), original);
+});
+
+test('Windows uses USERPROFILE and creates protected current-user ACLs on native transaction files', { skip: !windows }, t => {
+  const f = fixture(t, null);
+  const profile = f.path('用户 profile');
+  const env = { ...process.env, HOME: f.path('shell home'), USERPROFILE: profile, OLEAFLY_DATA_DIR: '' };
+  const result = spawnSync(process.execPath, ['-e',
+    'require(process.argv[1]).reconcile(JSON.parse(process.argv[2]))', require.resolve('../reconcile.cjs'),
+    JSON.stringify({ model, mcp: [mcp] })], { env, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.existsSync(join(env.HOME, '.oleafly')), false);
+  const root = join(profile, '.oleafly');
+  const acl = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `
+    $ErrorActionPreference = 'Stop'
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    foreach ($name in 'ai-secrets.key','ai-secrets.json','mcp-server-secrets.json','config.json',
+        '${stateFile}','.config-store.lock','.secret-store.lock') {
+      $acl = Get-Acl -LiteralPath (Join-Path $env:OLEAFLY_DATA_DIR $name)
+      $rules = $acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier])
+      if (!$acl.AreAccessRulesProtected -or $rules.Count -ne 1 -or $rules[0].IdentityReference -ne $user -or
+          $rules[0].AccessControlType -ne 'Allow' -or $rules[0].FileSystemRights -ne 'FullControl') { throw $name }
+    }
+  `], { env: { ...process.env, OLEAFLY_DATA_DIR: root }, encoding: 'utf8' });
+  assert.equal(acl.status, 0, acl.error?.message ?? acl.stderr);
+});
+
+test('preserves app and connector stores with a missing shared secret key', t => {
+  for (const name of ['app-secrets.json', 'connector-secrets.json']) {
+    const f = fixture(t);
+    writeSecrets(f, name, { existing: 'fixture' });
+    const key = fs.readFileSync(f.path('ai-secrets.key'));
+    fs.unlinkSync(f.path('ai-secrets.key'));
+    assert.throws(() => f.apply({ model }), /ai-secrets.key is missing or invalid/);
+    assert.equal(f.exists('ai-secrets.key'), false);
+    assert.equal(f.exists(stateFile), false);
+    fs.writeFileSync(f.path('ai-secrets.key'), key);
+    assert.deepEqual(secrets(f, name), { existing: 'fixture' });
+    assert.deepEqual(f.read(), original);
+  }
 });

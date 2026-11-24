@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes } = require('node:crypto');
 const { homedir } = require('node:os');
-const { join, resolve } = require('node:path');
+const { basename, join, resolve, toNamespacedPath } = require('node:path');
 const { isDeepStrictEqual } = require('node:util');
 
 const PROVIDER = 'magpie-oleafly';
@@ -42,9 +42,148 @@ const textMap = value => object(value) && Object.values(value).every(string);
 const control = value => /[\u0000-\u001f\u007f-\u009f]/u.test(value);
 const own = (value, key) => Object.hasOwn(value, key) ? value[key] : undefined;
 
+const windows = process.platform === 'win32';
+let winFiles;
+
+function windowsFiles() {
+  if (winFiles) return winFiles;
+  const { dlopen, CString, ptr, toArrayBuffer } = require('bun:ffi');
+  const api = (args, returns = 'i32') => ({ args, returns });
+  // HANDLE is pointer-sized. A signed return preserves INVALID_HANDLE_VALUE (-1) on both 64-bit ABIs.
+  const k = dlopen('kernel32.dll', {
+    CreateFileW: api(['ptr', 'u32', 'u32', 'ptr', 'u32', 'u32', 'ptr'], 'isize'),
+    GetLastError: api([], 'u32'),
+    GetFileType: api(['isize'], 'u32'),
+    GetFileInformationByHandle: api(['isize', 'ptr']),
+    LockFileEx: api(['isize', 'u32', 'u32', 'u32', 'u32', 'ptr']),
+    ReadFile: api(['isize', 'ptr', 'u32', 'ptr', 'ptr']),
+    WriteFile: api(['isize', 'ptr', 'u32', 'ptr', 'ptr']),
+    FlushFileBuffers: api(['isize']),
+    CloseHandle: api(['isize']),
+    MoveFileExW: api(['ptr', 'ptr', 'u32']),
+    LocalFree: api(['ptr'], 'ptr'),
+  }).symbols;
+  const security = dlopen('advapi32.dll', {
+    GetTokenInformation: api(['isize', 'u32', 'ptr', 'u32', 'ptr']),
+    ConvertSidToStringSidA: api(['ptr', 'ptr']),
+    ConvertStringSecurityDescriptorToSecurityDescriptorA: api(['ptr', 'u32', 'ptr', 'ptr']),
+  }).symbols;
+
+  // Oleafly protects its files with a non-inheriting DACL granting only TokenUser full access.
+  const token = Buffer.alloc(16 + 68); // TOKEN_USER followed by SECURITY_MAX_SID_SIZE.
+  const out = Buffer.alloc(8);
+  const size = Buffer.alloc(4);
+  const address = buffer => Number(buffer.readBigUInt64LE());
+  if (!security.GetTokenInformation(-4n, 1, token, token.length, size) || // GetCurrentProcessToken(), TokenUser
+      !security.ConvertSidToStringSidA(address(token), out)) fail('Cannot identify the current Windows account for Oleafly.');
+  const sid = address(out);
+  let attributes;
+  try {
+    const sddl = Buffer.from('D:P(A;;FA;;;' + new CString(sid).toString() + ')\0');
+    if (!security.ConvertStringSecurityDescriptorToSecurityDescriptorA(sddl, 1, out, size)) {
+      fail('Cannot secure the Oleafly configuration for the current Windows account.');
+    }
+    const descriptor = address(out);
+    try {
+      // Store SECURITY_ATTRIBUTES and its self-relative descriptor together for the cached CreateFileW calls.
+      attributes = Buffer.alloc(24 + size.readUInt32LE());
+      attributes.set(new Uint8Array(toArrayBuffer(descriptor, 0, size.readUInt32LE())), 24);
+      attributes.writeUInt32LE(24);
+      attributes.writeBigUInt64LE(BigInt(ptr(attributes, 24)), 8);
+    } finally {
+      k.LocalFree(descriptor);
+    }
+  } finally {
+    k.LocalFree(sid);
+  }
+
+  const wide = path => {
+    if (path.includes('\0')) fail('The Oleafly file path is invalid.');
+    return Buffer.from(toNamespacedPath(path) + '\0', 'utf16le');
+  };
+  const OPEN_EXISTING = 3, OPEN_ALWAYS = 4, CREATE_NEW = 1;
+  const READ = 0x80000000, WRITE = 0x40000000;
+  function open(path, access, share, creation) {
+    const handle = k.CreateFileW(wide(path), access, share, creation === OPEN_EXISTING ? null : attributes,
+      creation, 0x00200000 /* FILE_FLAG_OPEN_REPARSE_POINT */, null);
+    if (handle === -1n) {
+      const error = k.GetLastError();
+      if (creation === OPEN_EXISTING && (error === 2 || error === 3)) return undefined;
+      fail(`Cannot open Oleafly ${basename(path)}. Check its permissions and retry.`);
+    }
+    return handle;
+  }
+  function fileInfo(handle, name) {
+    const info = Buffer.alloc(52); // BY_HANDLE_FILE_INFORMATION
+    if (k.GetFileType(handle) !== 1 || !k.GetFileInformationByHandle(handle, info) ||
+        (info.readUInt32LE() & 0x410)) { // FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT
+      fail(`Oleafly ${name} is not a supported regular file. Review it before retrying.`);
+    }
+    return info;
+  }
+  winFiles = {
+    read(root, name, maximum) {
+      const handle = open(join(root, name), READ, 5 /* share read/delete */, OPEN_EXISTING);
+      if (handle === undefined) return undefined;
+      try {
+        const info = fileInfo(handle, name);
+        const length = info.readUInt32LE(32) * 2 ** 32 + info.readUInt32LE(36);
+        if (length > Math.min(maximum, 0xffffffff)) {
+          fail(`Oleafly ${name} is not a supported regular file. Review it before retrying.`);
+        }
+        const bytes = Buffer.alloc(length);
+        const count = Buffer.alloc(4);
+        if (length && (!k.ReadFile(handle, bytes, length, count, null) || count.readUInt32LE() !== length)) {
+          fail(`Cannot read Oleafly ${name}. Check its permissions and retry.`);
+        }
+        return bytes;
+      } finally {
+        k.CloseHandle(handle);
+      }
+    },
+    lock(root, name, run, wait) {
+      const handle = open(join(root, name), READ + WRITE, 3 /* share read/write */, OPEN_ALWAYS);
+      try {
+        fileInfo(handle, name);
+        // fs4 locks u64::MAX bytes at offset zero with a synchronous handle.
+        if (!k.LockFileEx(handle, wait ? 2 : 3, 0, 0xffffffff, 0xffffffff, Buffer.alloc(32))) {
+          if (k.GetLastError() === 33) {
+            fail(`Oleafly ${name} is busy. Retry after the current operation finishes.`, 'OLEAFLY_BUSY');
+          }
+          fail(`Cannot acquire Oleafly ${name}. Check its permissions and retry.`);
+        }
+        return run();
+      } finally {
+        k.CloseHandle(handle);
+      }
+    },
+    replace(temp, target, bytes) {
+      const handle = open(temp, WRITE, 0, CREATE_NEW);
+      try {
+        try {
+          const data = Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+          const count = Buffer.alloc(4);
+          if (!k.WriteFile(handle, data, data.length, count, null) || count.readUInt32LE() !== data.length ||
+              !k.FlushFileBuffers(handle)) throw new Error();
+        } finally {
+          k.CloseHandle(handle);
+        }
+        // Never overwrite a concurrently created native key. All other files replace in-place.
+        const flags = basename(target) === KEY ? 8 : 9; // WRITE_THROUGH | optional REPLACE_EXISTING
+        if (!k.MoveFileExW(wide(temp), wide(target), flags)) throw new Error();
+      } catch (error) {
+        try { fs.unlinkSync(temp); } catch { /* Preserve the write error. */ }
+        throw error;
+      }
+    },
+  };
+  return winFiles;
+}
+
 function readFile(root, name, maximum = Infinity) {
   let fd;
   try {
+    if (windows) return windowsFiles().read(root, name, maximum);
     fd = fs.openSync(join(root, name), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
     const stat = fs.fstatSync(fd);
     if (!stat.isFile() || stat.size > maximum) {
@@ -74,6 +213,7 @@ function parseObject(bytes, name) {
 }
 
 function syncDirectory(root) {
+  if (windows) return;
   const fd = fs.openSync(root, 'r');
   try {
     fs.fsyncSync(fd);
@@ -87,6 +227,7 @@ function replace(root, name, bytes) {
   const temp = `${target}.magpie-${randomBytes(12).toString('hex')}.tmp`;
   let temporary = false;
   try {
+    if (windows) return windowsFiles().replace(temp, target, bytes);
     const fd = fs.openSync(temp, 'wx', 0o600);
     temporary = true;
     try {
@@ -108,6 +249,7 @@ function replace(root, name, bytes) {
 }
 
 function withLock(root, name, run, wait = false) {
+  if (windows) return windowsFiles().lock(root, name, run, wait);
   let fd;
   try {
     fd = fs.openSync(join(root, name), fs.constants.O_RDWR | fs.constants.O_CREAT |
@@ -299,7 +441,10 @@ function reconcileLocked(root, model, mcp, rawState) {
   const rawKey = readFile(root, KEY, 32);
   const rawAI = readFile(root, AI_SECRETS);
   const rawMcp = readFile(root, MCP_SECRETS);
-  if ((rawKey && rawKey.length !== 32) || (!rawKey && (rawAI || rawMcp || rawState))) {
+  // Oleafly's file-backed app and connector stores share this key.
+  const otherStore = !rawKey && ['app-secrets.json', 'connector-secrets.json'].some(name =>
+    fs.lstatSync(join(root, name), { throwIfNoEntry: false }));
+  if ((rawKey && rawKey.length !== 32) || (!rawKey && (rawAI || rawMcp || rawState || otherStore))) {
     fail(`Oleafly ${KEY} is missing or invalid. Restore the secret key before retrying.`);
   }
   const key = rawKey ?? randomBytes(32);
@@ -579,8 +724,9 @@ function saveState(root, owned) {
  */
 function reconcile(options = {}) {
   try {
-    const home = process.env.HOME || process.env.USERPROFILE || homedir();
-    const root = resolve(options.dataDir ?? (process.env.OLEAFLY_DATA_DIR || join(home, '.oleafly')));
+    const { HOME, USERPROFILE, OLEAFLY_DATA_DIR } = process.env;
+    const home = windows ? USERPROFILE || HOME : HOME || USERPROFILE;
+    const root = resolve(options.dataDir ?? (OLEAFLY_DATA_DIR || join(home || homedir(), '.oleafly')));
     fs.mkdirSync(root, { recursive: true, mode: 0o700 });
     return withLock(root, '.config-store.lock', () => {
       let desired = options;
@@ -610,11 +756,93 @@ function reconcile(options = {}) {
 }
 
 const specDigest = spec => createHash('sha256').update(spec).digest('hex');
+const pendingAdvice = 'Oleafly cleanup is pending. Once Oleafly finishes saving, enable the plugin in Magpie (reinstall it if removed), then disable it again to finish cleanup.';
+const currentRemoval = (root, ticket) => readFile(root, CLEANUP_NOTE)?.toString().startsWith(ticket + '\n');
+const removalError = error => error instanceof ReconcileError ? error.message :
+  'Oleafly cleanup could not finish. Check permissions and retry removal in Magpie.';
+
+function finishRemoval(root, directory, ticket, hashes, wait) {
+  return withLock(root, '.config-store.lock', () => withLock(root, '.secret-store.lock', () => {
+    if (!currentRemoval(root, ticket)) return '';
+    const list = parseObject(readFile(directory, 'plugins.json'), 'plugins.json');
+    if (!Array.isArray(list.plugins) || list.plugins.some(row => !object(row) || !string(row.spec) ||
+        (row.off !== undefined && typeof row.off !== 'boolean'))) {
+      fail('Check the Magpie plugin list before retrying cleanup.');
+    }
+    let notice = '';
+    if (!list.plugins.some(row => !row.off && hashes.includes(specDigest(row.spec)))) {
+      const state = readFile(root, STATE);
+      if (state) notice = reconcileLocked(root, null, new Map(), state).conflicts.map(issue => issue.message).join('\n');
+    }
+    if (currentRemoval(root, ticket)) {
+      if (notice) replace(root, CLEANUP_NOTE, notice + '\n');
+      else fs.rmSync(join(root, CLEANUP_NOTE), { force: true });
+    }
+    return notice;
+  }, wait), wait);
+}
+
+function tryRemoval(root, directory, ticket, hashes, budgetMs) {
+  const deadline = performance.now() + budgetMs;
+  for (;;) {
+    try {
+      return finishRemoval(root, directory, ticket, hashes, false);
+    } catch (error) {
+      if (error.code !== 'OLEAFLY_BUSY') return removalError(error);
+      const left = deadline - performance.now();
+      if (left <= 0) return pendingAdvice;
+      Bun.sleepSync(Math.min(50, left));
+    }
+  }
+}
+
+function removalReceipt(note) {
+  if (!note) return;
+  const [ticket, , identity] = note.toString().split('\n');
+  if (!/^[0-9a-f]{32}$/.test(ticket) || !identity) return;
+  const [profile, ...hashes] = identity.split(' ');
+  if (DIGEST.test(profile) && hashes.length && hashes.every(hash => DIGEST.test(hash))) return { ticket, profile, hashes };
+}
+
+const sameInstallation = (receipt, directory, hashes) => receipt.profile === specDigest(resolve(directory)) &&
+  hashes.some(hash => receipt.hashes.includes(hash));
+
+// Retry once. An enabled alias cancels its own receipt; foreign profiles and install specs leave it intact.
+function retryPendingRemoval(root, directory, specs) {
+  try {
+    const receipt = removalReceipt(readFile(root, CLEANUP_NOTE));
+    const hashes = Array.from(specs, specDigest);
+    if (!receipt || !sameInstallation(receipt, directory, hashes)) return '';
+    return tryRemoval(root, directory, receipt.ticket, [...receipt.hashes, ...hashes], 0);
+  } catch (error) {
+    return removalError(error);
+  }
+}
 
 function deferRemoval(root, directory, specs, sourceFd) {
   const ticket = randomBytes(16).toString('hex');
+  const hashes = Array.from(specs, specDigest);
+  if (windows) {
+    // Magpie closes the host's Windows job on exit. Save recovery first and leave room in its two-second stop window.
+    // Both native locks may be busy. Serialize receipt publication separately for profiles sharing a data directory.
+    try {
+      const receipt = withLock(root, '.magpie-oleafly-cleanup.lock', () => {
+        const existing = removalReceipt(readFile(root, CLEANUP_NOTE));
+        if (existing) return existing;
+        const profile = specDigest(resolve(directory));
+        replace(root, CLEANUP_NOTE, [ticket, pendingAdvice, [profile, ...hashes].join(' '), ''].join('\n'));
+        return { ticket, profile, hashes };
+      });
+      if (!sameInstallation(receipt, directory, hashes)) {
+        return 'Another Magpie profile or installation has a pending Oleafly cleanup. Finish that cleanup before retrying removal.';
+      }
+      return tryRemoval(root, directory, receipt.ticket, [...receipt.hashes, ...hashes], 750);
+    } catch (error) {
+      return removalError(error);
+    }
+  }
   replace(root, CLEANUP_NOTE, ticket + '\nWaiting for Oleafly to release its configuration lock.\n');
-  const child = spawn(process.execPath, ['-', root, directory, ticket, ...Array.from(specs, specDigest)], {
+  const child = spawn(process.execPath, ['-', root, directory, ticket, ...hashes], {
     cwd: '/', detached: true, stdio: [sourceFd, 'ignore', 'ignore'],
   });
   child.unref();
@@ -623,38 +851,21 @@ function deferRemoval(root, directory, specs, sourceFd) {
 
 function cancelPendingRemoval(root) {
   const note = readFile(root, CLEANUP_NOTE);
-  if (note && /^[0-9a-f]{32}\n/.test(note.toString())) {
+  if (note && /^[0-9a-f]{32}\n/.test(note.toString()) && !removalReceipt(note)) {
     fs.rmSync(join(root, CLEANUP_NOTE), { force: true });
   }
 }
 
-module.exports = { reconcile, deferRemoval, cancelPendingRemoval };
+module.exports = { reconcile, deferRemoval, retryPendingRemoval, cancelPendingRemoval };
 
 // Magpie can unload the package while Oleafly is still writing. The host passes
 // this already-open module on stdin so this one cleanup can finish after unload.
-if (process.argv[1] === '-' && module.filename.endsWith('/[stdin]')) {
+if (process.argv[1] === '-' && basename(module.filename) === '[stdin]') {
   const [root, directory, ticket, ...specs] = process.argv.slice(2);
-  const current = () => readFile(root, CLEANUP_NOTE)?.toString().startsWith(ticket + '\n');
   try {
-    withLock(root, '.config-store.lock', () => withLock(root, '.secret-store.lock', () => {
-      if (!current()) return;
-      const list = parseObject(readFile(directory, 'plugins.json'), 'plugins.json');
-      if (!Array.isArray(list.plugins)) fail('Check the Magpie plugin list before retrying cleanup.');
-      if (!list.plugins.some(row => !row.off && specs.includes(specDigest(row.spec)))) {
-        const state = readFile(root, STATE);
-        if (state) {
-          const result = reconcileLocked(root, null, new Map(), state);
-          if (result.conflicts.length) {
-            replace(root, CLEANUP_NOTE, result.conflicts.map(issue => issue.message).join('\n') + '\n');
-            return;
-          }
-        }
-      }
-      fs.rmSync(join(root, CLEANUP_NOTE), { force: true });
-    }, true), true);
+    finishRemoval(root, directory, ticket, specs, true);
   } catch (error) {
-    if (current()) replace(root, CLEANUP_NOTE, (error instanceof ReconcileError ? error.message :
-      'Oleafly cleanup could not finish. Check permissions and retry removal in Magpie.') + '\n');
+    if (currentRemoval(root, ticket)) replace(root, CLEANUP_NOTE, removalError(error) + '\n');
     process.exitCode = 1;
   }
 }
