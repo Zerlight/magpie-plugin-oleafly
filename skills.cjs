@@ -5,7 +5,8 @@ const path = require('node:path');
 const { createHash } = require('node:crypto');
 
 const marker = '.magpie-library';
-const validId = (name) => typeof name === 'string' && name.length > 0 && name !== '.' && name !== '..' && !/[\\/:\p{Cc}\p{Cs}]/u.test(name);
+const validId = (name) => typeof name === 'string' && name.length > 0 && name !== '.' && name !== '..' && !/[\\/:\p{Cc}\p{Cs}]/u.test(name) &&
+  (process.platform !== 'win32' || !/[. ]$|[<>"|?*]|^(?:con|prn|aux|nul|(?:com|lpt)[1-9¹²³])(?:\.|$)/i.test(name));
 const sortNames = (a, b) => Buffer.compare(Buffer.from(a), Buffer.from(b));
 const sameFile = (a, b) => a.dev === b.dev && a.ino === b.ino;
 const sameVersion = (a, b) => sameFile(a, b) && a.size === b.size && a.mtimeNs === b.mtimeNs && a.ctimeNs === b.ctimeNs;
@@ -43,7 +44,7 @@ function copyHash(root, copiedAt) {
       if (item.isDirectory()) {
         if (!walk(file, `${relative}/`)) return false;
       } else if (item.isSymbolicLink()) {
-        const target = fs.readlinkSync(file, { encoding: 'buffer' });
+        const target = process.platform === 'win32' ? fs.readlinkSync(file).split(path.sep).join('/') : fs.readlinkSync(file, { encoding: 'buffer' });
         if (!sameVersion(item, stat(file))) throw new Error('Skill link changed');
         hash.update(`link ${relative} `).update(target).update('\n');
       } else {
@@ -63,7 +64,7 @@ function copyReceipt(directory, expectedSource) {
   if (stat(path.join(directory, '.oleafly-first-party')) || stat(path.join(directory, '.oleafly-skill.json'))) return null;
   const file = path.join(directory, marker);
   const info = stat(file);
-  if (!info?.isFile() || info.size > 8192n) return null;
+  if (!info?.isFile() || info.nlink !== 1n || info.size > 8192n) return null;
   let receipt;
   readRegular(file, info, (fd) => { receipt = fs.readFileSync(fd, 'utf8'); });
   const prefix = `copied from ${expectedSource} by magpie, and copied again when it changes\nhash `;

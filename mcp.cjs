@@ -65,7 +65,8 @@ function expandHome(value) {
 // npxDirect selects the installed package's own bin under the Magpie host's working directory.
 function cachedNpxMatches(directory, npx, args, command, stagedArgs) {
   if (!/(?:^|[/\\])npx(?:-cli)?(?:\.(?:js|cjs|mjs|cmd|bat|exe|ps1))?$/i.test(npx)) return false;
-  const node = path.join(path.dirname(npx), 'node');
+  const qualified = /[/\\]/.test(npx);
+  const node = path.join(path.dirname(npx), qualified && process.platform === 'win32' ? 'node.exe' : 'node');
   const index = args.findIndex(arg => arg !== '-y' && arg !== '--yes');
   if (command !== node || index < 1 || !isDeepStrictEqual(stagedArgs.slice(1), args.slice(index + 1).map(expandHome))) return false;
   const spec = args[index];
@@ -74,7 +75,7 @@ function cachedNpxMatches(directory, npx, args, command, stagedArgs) {
   const hash = createHash('sha256').update(spec).digest('hex').slice(0, 16);
   const root = path.join(directory, 'mcp-npm', hash, 'node_modules', pkg[1]);
   try {
-    if (/[/\\]/.test(npx) && !statSync(path.resolve(directory, node)).isFile()) return false;
+    if (qualified && !statSync(path.resolve(directory, node)).isFile()) return false;
     const { bin } = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
     let rel = bin;
     if (object(bin)) {

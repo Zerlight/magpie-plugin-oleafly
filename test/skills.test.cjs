@@ -31,6 +31,17 @@ function fixture(t) {
   return { at, copy, owned, root, sync };
 }
 
+test('Windows skill cleanup rejects names that alias another path', { skip: process.platform !== 'win32' }, t => {
+  const { copy, owned, sync, at } = fixture(t);
+  copy('paper');
+  for (const alias of ['paper.', '.. ', 'NUL.txt']) {
+    owned.push(alias);
+    assert.throws(() => sync(), /Invalid Oleafly skill cleanup inputs/);
+    owned.pop();
+    assert.ok(fs.existsSync(at('paper', 'SKILL.md')));
+  }
+});
+
 test('disable removes unchanged owned copies while preserving edited assets and user skills', (t) => {
   const { at, copy, owned, sync } = fixture(t);
   copy('pristine');
@@ -125,7 +136,7 @@ test('recovery never follows a linked retirement directory', (t) => {
   const { at, copy, root, sync } = fixture(t);
   copy('notes');
   const link = path.join(root, '.magpie-oleafly-retired-ABC123');
-  fs.symlinkSync(at(''), link);
+  fs.symlinkSync(at(''), link, process.platform === 'win32' ? 'junction' : 'dir');
   const result = sync({ retiredOnly: true });
   assert.deepEqual(result.removed, []);
   assert.ok(result.issues.some(issue => issue.message.includes(link)));
@@ -137,14 +148,15 @@ test('refuses linked roots and never follows a linked skill or marker', (t) => {
   const { at, copy, owned, root, sync } = fixture(t);
   const target = path.join(root, 'unrelated');
   fs.mkdirSync(target);
-  fs.symlinkSync(target, at('linked'));
+  fs.symlinkSync(target, at('linked'), process.platform === 'win32' ? 'junction' : 'dir');
   owned.push('linked');
   copy('linked-marker');
   fs.renameSync(at('linked-marker', '.magpie-library'), path.join(target, 'receipt'));
-  fs.symlinkSync(path.join(target, 'receipt'), at('linked-marker', '.magpie-library'));
+  if (process.platform === 'win32') fs.linkSync(path.join(target, 'receipt'), at('linked-marker', '.magpie-library'));
+  else fs.symlinkSync(path.join(target, 'receipt'), at('linked-marker', '.magpie-library'));
   assert.deepEqual(sync(), { removed: [], issues: [] });
   assert.ok(fs.existsSync(path.join(target, 'receipt')));
   fs.renameSync(at(''), path.join(root, 'real-skills'));
-  fs.symlinkSync(path.join(root, 'real-skills'), at(''));
+  fs.symlinkSync(path.join(root, 'real-skills'), at(''), process.platform === 'win32' ? 'junction' : 'dir');
   assert.throws(() => sync(), /not a real directory/);
 });

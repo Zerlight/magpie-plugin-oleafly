@@ -158,6 +158,12 @@ test('matches a cached npx rewrite only to the selected package bin and its argu
   const stage = { ...stdio, args: [join(pkg, 'main.cjs'), 'two words'] };
   const check = (entry, assigned = current) => translate({ local: entry }, library([assigned]), { directory });
   assert.deepEqual(check(stage).issues, []);
+  const windows = process.platform === 'win32';
+  const qualified = { ...current, command: join(directory, windows ? 'npx.cmd' : 'npx') };
+  const adjacent = join(directory, windows ? 'node.exe' : 'node');
+  writeFileSync(adjacent, '');
+  assert.equal(check({ ...stage, command: adjacent }, qualified).servers.length, 1);
+  assert.equal(check(stage, qualified).servers.length, 0);
   for (const change of [{ command: '/other/node' }, { args: [join(pkg, 'other.cjs'), 'two words'] }, { args: [stage.args[0]] }]) {
     assert.equal(check({ ...stage, ...change }).servers.length, 0);
   }
