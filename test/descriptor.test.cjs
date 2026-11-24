@@ -8,6 +8,13 @@ const { removeSkillCopies } = require("../skills.cjs")
 const entryPath = join(__dirname, "../oleafly.agent.js")
 const entry = import("data:text/javascript;base64," + readFileSync(entryPath).toString("base64"))
 
+test("the plugin and agent embed the bundled Oleafly logo", async () => {
+  const svg = readFileSync(join(__dirname, "../assets/oleafly/leaf.svg"))
+  const icon = "data:image/svg+xml;base64," + svg.toString("base64")
+  assert.equal(require("../package.json").magpie.icon, icon)
+  assert.equal((await entry).agent.icon, icon)
+})
+
 test("connect stages the gateway and agent identity beside Magpie's selected model", async () => {
   const { connect } = await entry
   const request = {

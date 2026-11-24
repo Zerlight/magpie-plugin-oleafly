@@ -2,6 +2,7 @@
 export const agent = {
   "id": "oleafly",
   "name": "Oleafly",
+  "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCIgd2lkdGg9IjI1NiIgaGVpZ2h0PSIyNTYiPgogIDxwYXRoIGQ9Ik0yMSAyQzYgMiA0IDE2IDMgMjJoMS45OThjLjY2Ni0zLjMzMyAyLjMzMy01LjE2NiA1LjAwMi01LjUgNC0uNSA3LTQgOC03bC0xLjUtMSAxLTFjMS0xIDIuMDA0LTIuNSAzLjUtNS41eiIgZmlsbD0iIzM0QjQ0QSIvPgo8L3N2Zz4K",
   "bin": "oleafly",
   "dir": "/Applications/Oleafly.app",
   "config": "~/.magpie-oleafly/agent.json",
